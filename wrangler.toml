@@ -1,0 +1,13 @@
+name = "theo-uptime"
+main = "src/index.js"
+compatibility_date = "2026-11-19"
+
+[triggers]
+# Every 5 minutes for the two Cloudflare sites, hourly for Hulog.
+crons = ["*/5 * * * *", "0 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "uptime"
+# PLACEHOLDER: replace with the database_id printed by `npx wrangler d1 create uptime`.
+database_id = "00000000-0000-0000-0000-000000000000"
