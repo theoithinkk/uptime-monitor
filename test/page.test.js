@@ -37,10 +37,11 @@ test('status page escapes database text and ships no script', async () => {
   assert.match(html, /&#60;script&#62;alert\(1\)&#60;\/script&#62;/);
   assert.match(html, /1 service down/);
   assert.match(html, /Overspent by/);
-  assert.match(html, /No probes yet/); // hulog has no rows
+  assert.match(html, /Paused: Hulog/); // paused targets are named in the footer, not hidden
 });
 
 test('status page with no probes at all says it is waiting', async () => {
   const { html } = await page({});
   assert.match(html, /Waiting for first probes/);
+  assert.match(html, /No probes yet/);
 });

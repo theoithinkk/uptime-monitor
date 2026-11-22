@@ -10,10 +10,18 @@ const TARGETS = [
     cron: '*/5 * * * *', timeout: 10_000, threshold: 1000, slo: 0.999, latencySlo: 0.99 },
   { id: 'writeups', name: 'CTF writeups', url: 'https://writeups.theoith.ink/',
     cron: '*/5 * * * *', timeout: 10_000, threshold: 1000, slo: 0.999, latencySlo: 0.99 },
+];
+// Not probed and not shown as a card; the page footer says why. Settings are
+// kept so a target can move back into TARGETS unchanged.
+const PAUSED = [
   // Render's free tier sleeps after 15 idle minutes. Probing hourly lets it
   // sleep, so this measures the cold start a real visitor gets.
+  // Paused 2026-11-22: Cloudflare's bot check in front of onrender.com answers
+  // requests from Workers with 429 and cf-mitigated: challenge.
   { id: 'hulog', name: 'Hulog', url: 'https://hulog.onrender.com/',
-    cron: '0 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95 },
+    cron: '0 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95,
+    why: 'The bot check in front of onrender.com blocks requests sent from Cloudflare Workers (HTTP 429), '
+      + 'so a probe from here would measure that block, not Hulog. It comes back once it is probed from outside Cloudflare.' },
 ];
 // Must match the crons in wrangler.toml.
 const EVERY = { '*/5 * * * *': 'every 5 minutes', '0 * * * *': 'every hour' };
@@ -408,6 +416,7 @@ function renderPage(stats, now) {
   <p>What is probed, and how often. A probe is up when the site answers 2xx within the timeout.
     The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.</p>
   <ul>${probed}</ul>
+  ${PAUSED.map((t) => `<p>Paused: ${esc(t.name)} (${esc(new URL(t.url).host)}). ${esc(t.why)}</p>`).join('')}
   <p>Probes run on a Cloudflare Cron Trigger, from whichever Cloudflare data center picks up the job.
     That means this monitor shares fate with the two Cloudflare-hosted sites: if Cloudflare has an outage,
     those sites and this page can go down together, and no alert goes out.</p>
