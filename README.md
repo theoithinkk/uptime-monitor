@@ -2,7 +2,7 @@
 
 A small Cloudflare Worker that probes my three sites, measures them against written SLOs, shows the result on a status page and sends a Telegram alert when one goes down.
 
-The SLOs themselves are in [SLO.md](SLO.md).
+Live at https://status.theoith.ink/. The SLOs themselves are in [SLO.md](SLO.md).
 
 ## How it works
 
@@ -86,7 +86,9 @@ Run these yourself. They log in to Cloudflare and create real resources.
    npx wrangler tail
    ```
 
-The status page is then at `https://theo-uptime.<your-subdomain>.workers.dev/`.
+A new Cron Trigger can take up to 15 minutes to reach every Cloudflare data center, so the first scheduled run may be skipped.
+
+`wrangler.toml` serves the page on the custom domain `status.theoith.ink` and turns workers.dev off. The workers.dev URL carries the account's subdomain, which Cloudflare builds from the login email. For your own copy, change the `routes` pattern to a domain in your Cloudflare account, or delete `routes` and set `workers_dev = true`.
 
 ## Design decisions
 
