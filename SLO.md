@@ -51,6 +51,8 @@ The budget is always counted against a full 30-day window, even before 30 days o
 
 **Why these targets.** Hulog runs on Render's free tier, which sleeps after 15 idle minutes. Hourly probes let it sleep, so most probes find it asleep and measure a cold start. On 2026-11-22 a cold start answered 200 in 36.6 s. The 60 s threshold is about 1.6 times that. The 95% target accepts that free-tier wake times vary. The 90 s timeout sits above the threshold, so a wake between 60 and 90 s counts as up but slow. It spends latency budget, not availability budget. 99% availability fits a single free instance that sleeps and restarts. At 99.9% the budget would be 0.72 probes, so one failed probe would break the SLO.
 
+**Paused 2026-11-22.** The first live probe, at 08:00 UTC, got HTTP 429 in 248 ms. A test from a Cloudflare data center then got the same 429 in 10 ms, with `cf-mitigated: challenge` and a "Just a moment..." page, whether the User-Agent was the monitor's or a browser's. The bot check in front of onrender.com blocks requests sent from Cloudflare Workers, so the probe measured that block and never reached Hulog. I deleted that one probe and its daily row, because they describe the block, not Hulog. Hulog is not probed until it can be probed from outside Cloudflare, and this SLO starts counting again from that date. I will not try to get around the bot check: the probe would then measure something no real visitor does.
+
 ## Error budget policy
 
 This is a solo project, so the policy is short enough that I will actually follow it.
