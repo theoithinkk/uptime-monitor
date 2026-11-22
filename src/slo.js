@@ -38,6 +38,24 @@ export function budgetMinutes(slo, days = 30) {
   return (1 - slo) * days * 24 * 60;
 }
 
+// Burn rate: a window's error rate divided by the error rate the SLO allows.
+// 1 spends the budget exactly on pace to run out at the end of the 30 days;
+// 10 would spend a whole window's budget in 3 days. null with no probes.
+export function burnRate(total, bad, slo) {
+  return total > 0 && slo < 1 ? bad / total / (1 - slo) : null;
+}
+
+// Budget left after each day of the window, oldest first, for the burndown.
+// bads[i] is day i's failed probes, 0 for a day with no data: missing data spends
+// nothing. allowed is the full window's budget in probes, the same one
+// budgetRemaining uses, so the last value always matches the headline number.
+// Never clamped: an overspent budget goes below 0.
+export function burndown(bads, allowed) {
+  if (!(allowed > 0)) return null;
+  let spent = 0;
+  return bads.map((bad) => 1 - (spent += bad) / allowed);
+}
+
 // Nearest-rank percentile, p in 1..100. The answer is always a real sample.
 export function percentile(values, p) {
   if (values.length === 0) return null;

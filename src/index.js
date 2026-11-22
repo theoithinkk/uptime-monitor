@@ -1,6 +1,6 @@
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
-  budgetRemaining, budgetMinutes, percentile, alertFor,
+  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown,
 } from './slo.js';
 
 // What gets probed. Hardcoded on purpose: no request can make this Worker
@@ -20,7 +20,7 @@ const TARGETS = [
 ];
 // The only targets /ingest accepts. Anything else is a 404.
 const EXTERNAL = new Map(TARGETS.filter((t) => t.source).map((t) => [t.id, t]));
-// Not probed and not shown as a card; the page footer names each one and its
+// Not probed and not shown as a panel; the page footer names each one and its
 // `why`. Empty for now. A paused target keeps its settings so it can move back.
 const PAUSED = [];
 // Must match the crons in wrangler.toml, or the workflow for an external target.
@@ -40,6 +40,10 @@ const INGEST_FIELDS = ['target', 'ok', 'status', 'ms', 'err'];
 
 const WINDOW_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+// Fewest probes a burn rate is shown for. Below this one failure moves the rate
+// in steps too big to mean anything, so Hulog's hourly probe gets no 1 h rate.
+const BURN_MIN_PROBES = 10;
 const USER_AGENT = 'theo-uptime/1.0';
 const HEADERS = {
   'content-security-policy':
@@ -136,8 +140,10 @@ async function sendTelegram(env, text) {
 
 // ---------- status page ----------
 
-// Reads about 700 rows per view: per target, 30 daily rows,
-// about 288 raw rows for the 24 h p95, and the newest probe.
+// Reads about 700 rows per view: per target, 30 daily rows, every raw row from
+// the last 24 h (about 288) and the newest probe. The 24 h query read the failed
+// probes before as well (ok is not part of the key), so returning them for the
+// burn rate and the latency line costs no extra rows.
 async function loadStats(env, now) {
   const since = dayOf(now - (WINDOW_DAYS - 1) * DAY_MS);
   const res = await env.DB.batch(TARGETS.flatMap((t) => [
@@ -145,21 +151,25 @@ async function loadStats(env, now) {
       .bind(t.id),
     env.DB.prepare('SELECT day, total, good, fast FROM daily WHERE target = ?1 AND day >= ?2')
       .bind(t.id, since),
-    env.DB.prepare('SELECT ms FROM probes WHERE target = ?1 AND ts >= ?2 AND ok = 1')
+    env.DB.prepare('SELECT ts, ok, ms FROM probes WHERE target = ?1 AND ts >= ?2 ORDER BY ts')
       .bind(t.id, now - DAY_MS),
   ]));
   return TARGETS.map((t, i) => {
     const [last, days, recent] = res.slice(i * 3, i * 3 + 3).map((r) => r.results);
-    return { t, last: last[0] ?? null, days, p95: percentile(recent.map((r) => r.ms), 95) };
+    return { t, last: last[0] ?? null, days, recent };
   });
 }
 
 // Every value that reaches the HTML goes through this, database values included.
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-const pct = (x, digits = 2) => `${(x * 100).toFixed(digits)}%`;
+const pct = (x, digits = 2) => `${(x * 100).toFixed(digits)}%`.replace('-', '−'); // a real minus sign
 const target = (x) => `${+(x * 100).toFixed(2)}%`; // 0.999 -> 99.9%
 const dur = (ms) => (ms < 10_000 ? `${ms} ms` : `${+(ms / 1000).toFixed(1)} s`);
 const stamp = (ts) => `${new Date(ts).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+const rate = (x) => `${x.toFixed(x < 10 ? 1 : 0)}x`;
+const leftText = (v) => (v >= 0 ? `${pct(v, 1)} left` : `overspent by ${pct(-v, 1)}`);
+// Chart coordinates. Numbers only, escaped anyway so every value takes the same path.
+const num = (x) => esc((+x).toFixed(2));
 
 function ago(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -169,8 +179,9 @@ function ago(ms) {
   return `${Math.round(s / 86400)} d ago`;
 }
 
-// Strip colour: met the SLO, missed it, or missed it by more than 10x the budget.
-const level = (a, slo) => (a >= slo ? 'good' : a >= 1 - 10 * (1 - slo) ? 'warn' : 'bad');
+// One rule colours a day in the strip and a recent burn rate: good while it spends
+// budget no faster than the SLO allows (burn rate up to 1), bad past 10 times that.
+const toneOf = (burn) => (burn === null ? 'none' : burn <= 1 ? 'good' : burn <= 10 ? 'warn' : 'bad');
 const LEVEL = { good: 'met the SLO', warn: 'missed', bad: 'missed badly', none: 'no data' };
 
 // The badge is the newest probe only. Slow: it answered, but over the latency threshold.
@@ -184,6 +195,16 @@ function stateOf({ t, last }, now) {
   if (!last.ok) return 'down';
   return last.ms > t.threshold ? 'slow' : 'up';
 }
+
+// A shape for every tone, so colour is never the only signal: check, triangle,
+// cross in an octagon, and a dashed circle for no current data.
+const ICON = {
+  good: '<circle class="f" cx="8" cy="8" r="7.5"/><path class="g" d="M4.6 8.3l2.2 2.2 4.6-4.8"/>',
+  warn: '<path class="f" d="M8 .9l7.4 13.6H.6z"/><path class="g" d="M8 5.8v3.9M8 12.2v.1"/>',
+  bad: '<path class="f" d="M5.1 .9h5.8l4.2 4.2v5.8l-4.2 4.2H5.1L.9 10.9V5.1z"/><path class="g" d="M5.5 5.5l5 5m0-5l-5 5"/>',
+  none: '<circle class="d" cx="8" cy="8" r="6.6"/>',
+};
+const icon = (tone) => `<svg class="icon" viewBox="0 0 16 16" aria-hidden="true">${ICON[tone]}</svg>`;
 
 // One headline for the whole page, worst news first.
 function overall(stats, now) {
@@ -202,60 +223,238 @@ function overall(stats, now) {
   return { tone: 'good', head: none.length ? 'All probed services operational' : 'All services operational', notes };
 }
 
-// Error budget as text plus a bar. left: 1 untouched, 0 spent, below 0 overspent.
+// Everything the tile and the panel show for one service, worked out once.
+function derive(s, now) {
+  const { t, days, recent } = s;
+  const state = stateOf(s, now);
+  const perWindow = WINDOW_DAYS * PER_DAY[t.cron];
+  const w = sum(days);
+  const byDay = new Map(days.map((d) => [d.day, d]));
+  // The window's UTC days, oldest first, each with its rollup row or null.
+  const cal = Array.from({ length: WINDOW_DAYS }, (_, i) => {
+    const day = dayOf(now - (WINDOW_DAYS - 1 - i) * DAY_MS);
+    return { day, d: byDay.get(day) ?? null };
+  });
+  const burn = (since) => {
+    const r = recent.filter((p) => p.ts >= since);
+    // Under BURN_MIN_PROBES one failure moves the rate in huge steps, so no number.
+    return r.length < BURN_MIN_PROBES ? null : burnRate(r.length, r.filter((p) => !p.ok).length, t.slo);
+  };
+  return {
+    ...s, state, tone: STATE[state][0], label: STATE[state][1], cal,
+    avail: availability(w), lat: latency(w),
+    left: w.total ? budgetRemaining(t.slo, perWindow, w.total - w.good) : null,
+    series: burndown(cal.map(({ d }) => (d ? d.total - d.good : 0)), (1 - t.slo) * perWindow),
+    p95: percentile(recent.filter((p) => p.ok).map((p) => p.ms), 95),
+    burn24: burn(now - DAY_MS), burn1: burn(now - HOUR_MS),
+  };
+}
+
+// Error budget as a figure, a sentence and a meter. left: 1 untouched, 0 spent, below 0 overspent.
 function budget(t, left) {
-  if (left === null) return { tone: 'none', text: '<b>No data</b>', bar: '' };
+  if (left === null) return { tone: 'none', value: 'No data', text: 'No probes in the window yet', bar: '' };
   const mins = budgetMinutes(t.slo);
   if (left < 0) {
-    return { tone: 'bad', bar: '<span class="over"></span>',
-      text: `<b>Overspent by ${esc(pct(-left, 1))}</b> ${esc((-left * mins).toFixed(1))} min over a ${esc(mins.toFixed(1))} min budget` };
+    return { tone: 'bad', value: pct(left, 1), bar: '<span class="over"></span>',
+      text: `Overspent by ${(-left * mins).toFixed(1)} min of a ${mins.toFixed(1)} min budget` };
   }
-  return { tone: left > 0.25 ? 'good' : left > 0 ? 'warn' : 'bad',
-    bar: `<span style="width:${esc((left * 100).toFixed(1))}%"></span>`,
-    text: `<b>${left > 0 ? `${esc(pct(left, 1))} left` : 'Spent'}</b> ${esc((left * mins).toFixed(1))} of ${esc(mins.toFixed(1))} min` };
+  return { tone: left > 0.25 ? 'good' : left > 0 ? 'warn' : 'bad', value: pct(left, 1),
+    bar: `<span style="width:${num(left * 100)}%"></span>`,
+    text: left > 0 ? `${(left * mins).toFixed(1)} of ${mins.toFixed(1)} min left` : `Spent, all ${mins.toFixed(1)} min` };
+}
+
+const note = (tone, text) => `<p class="s ${tone}">${icon(tone)}<span>${esc(text)}</span></p>`;
+const kpi = (tone, label, value, extra) => `
+      <div class="kpi ${tone}"><p class="k">${esc(label)}</p><p class="v">${esc(value)}</p>${extra}</div>`;
+
+// Summary tile: state first, then the two numbers that say how bad.
+function tile(v) {
+  const figs = v.last
+    ? `<span><b>${esc(v.avail === null ? 'No data' : pct(v.avail))}</b> availability</span>
+      <span><b>${esc(budget(v.t, v.left).value)}</b> budget left</span>`
+    : '<span>No probes yet</span>';
+  return `
+  <li><a class="tile ${v.tone}" href="#${esc(v.t.id)}">
+    <span class="state">${icon(v.tone)}${v.label}</span>
+    <span class="name">${esc(v.t.name)}</span>
+    <span class="figs">${figs}</span>
+  </a></li>`;
+}
+
+// Plots are drawn in a 100 x 100 box stretched to the container, so the same
+// numbers place the HTML labels as percentages. Strokes keep their width
+// (vector-effect in the CSS), and the labels are HTML so they never stretch.
+function figure(title, caption, body) {
+  return `
+    <figure class="chart">
+      <figcaption><h3>${title}</h3><p>${caption}</p></figcaption>${body}
+    </figure>`;
+}
+
+function burndownChart(v) {
+  const { t, cal, series } = v;
+  const caption = 'Budget left after each day of the window. Dashed: spending exactly on pace (1.0x).';
+  if (v.left === null) return figure('Error budget burndown', caption, '<p class="nodata">No probes in the window yet.</p>');
+  const end = series[series.length - 1]; // the burndown only falls, so this is also the lowest point
+  const lo = Math.min(0, end);
+  const y = (val) => 14 + ((1 - val) / (1 - lo)) * 78; // room above 100% for its label, below 0 for air
+  const pts = [[0, y(1)], ...series.map((val, i) => [((i + 1) / WINDOW_DAYS) * 100, y(val)])];
+  const line = `M${pts.map(([a, b]) => `${num(a)} ${num(b)}`).join('L')}`;
+  const z = y(0);
+  const area = `${line}L100 ${num(z)}L0 ${num(z)}Z`;
+  const yEnd = num(y(end));
+  const spent = cal[series.findIndex((val) => val <= 0)]?.day;
+  const id = `${esc(t.id)}-bd`;
+  const hits = cal.map(({ day, d }, i) => `<rect class="hit" x="${num((i * 100) / WINDOW_DAYS)}" y="0" width="${num(100 / WINDOW_DAYS)}" height="100">`
+    + `<title>${esc(`${day}: ${d ? `${d.total - d.good} failed of ${d.total} probes` : 'no data'}, budget ${leftText(series[i])}`)}</title></rect>`).join('');
+  const over = end < 0 ? ' bad' : '';
+  return figure('Error budget burndown', caption, `
+      <div class="plot">
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
+          <title id="${id}-t">Error budget left over the last 30 days</title>
+          <desc id="${id}-d">${esc(`From 100% on ${cal[0].day} to ${leftText(end)} today.${spent ? ` It ran out on ${spent}.` : ''}`)}</desc>
+          <defs>
+            <clipPath id="${id}-pos"><rect x="-5" y="-5" width="110" height="${num(z + 5)}"/></clipPath>
+            <clipPath id="${id}-neg"><rect x="-5" y="${num(z)}" width="110" height="${num(105 - z)}"/></clipPath>
+          </defs>
+          <path class="grid" d="M0 ${num(y(1))}H100"/>
+          <path class="wash" d="${area}" clip-path="url(#${id}-pos)"/>
+          <path class="wash bad" d="${area}" clip-path="url(#${id}-neg)"/>
+          <path class="pace" d="M0 ${num(y(1))}L100 ${num(z)}"/>
+          <path class="axis" d="M0 ${num(z)}H100"/>
+          <path class="ln" d="${line}" clip-path="url(#${id}-pos)"/>
+          <path class="ln bad" d="${line}" clip-path="url(#${id}-neg)"/>
+          <path class="ring" d="M100 ${yEnd}h0"/><path class="dot${over}" d="M100 ${yEnd}h0"/>
+          ${hits}
+        </svg>
+        <span class="lbl" style="top:${num(y(1))}%" aria-hidden="true">100%</span>
+        <span class="lbl" style="top:${num(z)}%" aria-hidden="true">0%, budget spent</span>
+        <span class="lbl end${over}${y(end) < 30 ? ' below' : ''}" style="top:${yEnd}%" aria-hidden="true">${esc(leftText(end))}</span>
+      </div>
+      <div class="ends" aria-hidden="true"><span>${esc(cal[0].day)}</span><span>Today</span></div>`);
+}
+
+function latencyChart(v, now) {
+  const { t, recent } = v;
+  const caption = `Time to response headers for each probe. Dashed: the ${esc(dur(t.threshold))} threshold. Red ticks: failed probes.`;
+  if (!recent.length) return figure('Response time, last 24 h', caption, '<p class="nodata">No probes in the last 24 hours.</p>');
+  const start = now - DAY_MS;
+  const good = recent.filter((r) => r.ok);
+  const okMs = good.map((r) => r.ms);
+  const top = Math.max(t.threshold * 1.25, ...okMs) * 1.1;
+  const x = (ts) => Math.min(100, Math.max(0, ((ts - start) / DAY_MS) * 100));
+  const y = (ms) => 100 - (ms / top) * 100;
+  // A failed probe has no latency worth drawing, so the line breaks there.
+  let line = '';
+  let pen = 'M';
+  for (const r of recent) {
+    if (!r.ok) { pen = 'M'; continue; }
+    line += `${pen}${num(x(r.ts))} ${num(y(r.ms))}`;
+    pen = 'L';
+  }
+  const thr = y(t.threshold);
+  const fails = recent.filter((r) => !r.ok).map((r) => `M${num(x(r.ts))} 100V88`).join('');
+  // Hourly probes are few enough to mark one by one; 288 dots would be a smear.
+  const dots = good.length && good.length <= 48 ? good.map((r) => `M${num(x(r.ts))} ${num(y(r.ms))}h0`).join('') : '';
+  const id = `${esc(t.id)}-lt`;
+  // One hover target per clock hour, so the tooltip finds the time, not a 2 px line.
+  const firstHour = Math.floor(start / HOUR_MS) * HOUR_MS;
+  const hits = Array.from({ length: 25 }, (_, h) => {
+    const from = firstHour + h * HOUR_MS;
+    const inHour = recent.filter((r) => r.ts >= from && r.ts < from + HOUR_MS);
+    if (!inHour.length) return '';
+    const ms = inHour.filter((r) => r.ok).map((r) => r.ms);
+    const parts = [`${inHour.length} probe${inHour.length === 1 ? '' : 's'}`];
+    if (ms.length) parts.push(`median ${dur(percentile(ms, 50))}`, `slowest ${dur(Math.max(...ms))}`);
+    if (ms.length < inHour.length) parts.push(`${inHour.length - ms.length} failed`);
+    const x0 = x(from);
+    return `<rect class="hit" x="${num(x0)}" y="0" width="${num(x(from + HOUR_MS) - x0)}" height="100">`
+      + `<title>${esc(`${new Date(from).toISOString().slice(11, 16)} UTC: ${parts.join(', ')}`)}</title></rect>`;
+  }).join('');
+  const slow = okMs.filter((ms) => ms > t.threshold).length;
+  const failed = recent.length - good.length;
+  const summary = okMs.length
+    ? `${recent.length} probes. Of the ${okMs.length} that answered: median ${dur(percentile(okMs, 50))}, p95 ${dur(v.p95)}, slowest ${dur(Math.max(...okMs))}, ${slow} over the ${dur(t.threshold)} threshold. ${failed} failed.`
+    : `${recent.length} probes, all failed.`;
+  // Each line is written twice, clipped above and below the threshold. A <use> would
+  // save the bytes, but Chrome then stretches its stroke despite non-scaling-stroke.
+  return figure('Response time, last 24 h', caption, `
+      <div class="plot">
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
+          <title id="${id}-t">Response time over the last 24 hours</title>
+          <desc id="${id}-d">${esc(summary)}</desc>
+          <defs>
+            <clipPath id="${id}-hi"><rect x="-5" y="-5" width="110" height="${num(thr + 5)}"/></clipPath>
+            <clipPath id="${id}-lo"><rect x="-5" y="${num(thr)}" width="110" height="${num(105 - thr)}"/></clipPath>
+          </defs>
+          <path class="axis" d="M0 100H100"/>
+          <path class="thr" d="M0 ${num(thr)}H100"/>
+          <path class="ln" d="${line}" clip-path="url(#${id}-lo)"/>
+          <path class="ln warn" d="${line}" clip-path="url(#${id}-hi)"/>
+          ${dots ? `<path class="ring" d="${dots}"/><path class="dot" d="${dots}" clip-path="url(#${id}-lo)"/><path class="dot warn" d="${dots}" clip-path="url(#${id}-hi)"/>` : ''}
+          ${fails ? `<path class="fail" d="${fails}"/>` : ''}
+          ${hits}
+        </svg>
+        <span class="lbl" style="top:${num(thr)}%" aria-hidden="true">${esc(dur(t.threshold))} threshold</span>
+      </div>
+      <div class="ends" aria-hidden="true"><span>24 h ago</span><span>Now</span></div>`);
 }
 
 // 30 daily bars, oldest first. The bars are hidden from screen readers;
-// the sentence under them carries the same facts as text.
-function strip(t, days, now) {
-  const byDay = new Map(days.map((d) => [d.day, d]));
+// the sentence under them carries the same facts, and the table every number.
+function history(v) {
+  const { t, cal } = v;
   const count = { good: 0, warn: 0, bad: 0, none: 0 };
   let worst = null;
-  const first = dayOf(now - (WINDOW_DAYS - 1) * DAY_MS);
-  const bars = Array.from({ length: WINDOW_DAYS }, (_, i) => {
-    const day = dayOf(now - (WINDOW_DAYS - 1 - i) * DAY_MS);
-    const d = byDay.get(day);
+  const bars = cal.map(({ day, d }) => {
     if (!d) {
       count.none++;
       return `<span class="none" title="${esc(day)}: no data"></span>`;
     }
     const a = d.good / d.total;
-    const cls = level(a, t.slo);
-    count[cls]++;
-    if (cls !== 'good' && (!worst || a < worst.a)) worst = { day, a };
-    return `<span class="${cls}" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} probes, ${LEVEL[cls]}`)}"></span>`;
+    const tone = toneOf(burnRate(d.total, d.total - d.good, t.slo));
+    count[tone]++;
+    if (tone !== 'good' && (!worst || a < worst.a)) worst = { day, a };
+    return `<span class="${tone}" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} probes, ${LEVEL[tone]}`)}"></span>`;
   }).join('');
-  const parts = Object.keys(count).filter((k) => count[k]).map((k) => `${count[k]} ${LEVEL[k]}`);
+  const parts = Object.keys(count).filter((k) => count[k])
+    .map((k) => `<span class="key"><i class="sw ${k}" aria-hidden="true"></i>${esc(`${count[k]} ${LEVEL[k]}`)}</span>`);
   const low = worst ? ` Worst day ${worst.day} at ${pct(worst.a)}.` : '';
   return `
-  <div class="days">
-    <div aria-hidden="true">
-      <div class="strip">${bars}</div>
-      <div class="ends"><span>${esc(first)}</span><span>Today</span></div>
-    </div>
-    <p class="daysum">Last 30 days: ${esc(parts.join(', '))}.${esc(low)}</p>
-  </div>`;
+    <figure class="chart wide">
+      <figcaption><h3>Daily availability, 30 days</h3><p>One bar per UTC day against the ${esc(target(t.slo))} SLO. Hover a bar for its numbers.</p></figcaption>
+      <div aria-hidden="true">
+        <div class="strip">${bars}</div>
+        <div class="ends"><span>${esc(cal[0].day)}</span><span>Today</span></div>
+      </div>
+      <p class="daysum">Last 30 days: ${parts.join(', ')}.${esc(low)}</p>
+    </figure>`;
 }
 
-function card(s, now) {
-  const { t, last, days, p95 } = s;
-  const state = stateOf(s, now);
-  const [tone, label] = STATE[state];
+// The table twin of the strip and the burndown, newest day first, collapsed.
+function table(v) {
+  const rows = v.cal.map(({ day, d }, i) => `<tr><td>${esc(day)}</td>${d
+    ? `<td>${esc(d.total)}</td><td>${esc(d.total - d.good)}</td><td>${esc(pct(d.good / d.total))}</td>`
+    : '<td colspan="3">No data</td>'}<td>${esc(pct(v.series[i], 1))}</td></tr>`).reverse().join('');
+  return `
+    <details class="raw"><summary>Daily numbers</summary>
+      <div class="scroll"><table>
+        <thead><tr><th scope="col">Day, UTC</th><th scope="col">Probes</th><th scope="col">Failed</th><th scope="col">Up</th><th scope="col">Budget left</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </details>`;
+}
+
+const BURN = { good: 'Within the pace the SLO allows', warn: 'Faster than the SLO allows',
+  bad: 'Over 10x the pace the SLO allows', none: 'Too few probes in the last 24 h' };
+
+function panel(v, now) {
+  const { t, last } = v;
   const head = `
-  <div class="head">
+  <header class="phead">
     <div><h2>${esc(t.name)}</h2><a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a></div>
-    <span class="pill ${tone}">${label}</span>
-  </div>`;
+    <span class="pill ${v.tone}">${icon(v.tone)}${v.label}</span>
+  </header>`;
 
   if (!last) {
     // Cloudflare crons fire on the clock, so the next run is the next multiple.
@@ -264,7 +463,7 @@ function card(s, now) {
     const wait = Math.max(1, Math.round((Math.ceil(now / every) * every - now) / 60_000));
     const next = t.source ? 'after the next GitHub Actions run' : `in about ${wait} min`;
     return `
-<section class="card">${head}
+<section class="panel" id="${esc(t.id)}">${head}
   <div class="empty">
     <p><b>No probes yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive ${esc(next)}.</p>
     <p>It will be held to ${esc(target(t.slo))} availability, with ${esc(target(t.latencySlo))} of good probes answering within ${esc(dur(t.threshold))}.</p>
@@ -272,48 +471,52 @@ function card(s, now) {
 </section>`;
   }
 
-  const w = sum(days);
-  const avail = availability(w);
-  const lat = latency(w);
-  const left = w.total ? budgetRemaining(t.slo, WINDOW_DAYS * PER_DAY[t.cron], w.total - w.good) : null;
-  const b = budget(t, left);
-  const verdict = (x, goal, what) => (x === null ? '' : x >= goal
-    ? `<span class="verdict good">Meets ${esc(target(goal))} ${what}</span>`
-    : `<span class="verdict bad">Below ${esc(target(goal))} ${what}</span>`);
   const result = last.status === null ? esc(last.err) : `HTTP ${esc(last.status)} in ${esc(dur(last.ms))}`;
   const when = `<time datetime="${esc(new Date(last.ts).toISOString())}" title="${esc(stamp(last.ts))}">${esc(ago(now - last.ts))}</time>`;
-
-  const stale = state === 'stale'
+  const stale = v.state === 'stale'
     ? `\n  <p class="last">Stale: no probe since then, though it should run ${esc(EVERY[t.cron] ?? t.cron)}. Its current state is unknown.</p>`
     : '';
+  const verdict = (x, goal, what) => (x === null ? note('none', 'No data yet')
+    : x >= goal ? note('good', `Meets the ${target(goal)} ${what}`) : note('bad', `Below the ${target(goal)} ${what}`));
+
+  const b = budget(t, v.left);
+  const b24 = toneOf(v.burn24);
+  const hour = v.burn1 === null ? '<p class="s">Last 1 h: too few probes for a rate</p>' : note(toneOf(v.burn1), `Last 1 h: ${rate(v.burn1)}`);
+  const newest = {
+    up: [dur(last.ms), 'good', `Under the ${dur(t.threshold)} threshold`],
+    slow: [dur(last.ms), 'warn', `Over the ${dur(t.threshold)} threshold`],
+    down: ['Failed', 'bad', last.status === null ? 'No response' : `HTTP ${last.status}`],
+    stale: [last.ok ? dur(last.ms) : 'Failed', 'none', `${ago(now - last.ts)}, current state unknown`],
+  }[v.state];
 
   return `
-<section class="card${state === 'down' ? ' is-down' : ''}">${head}
+<section class="panel${v.state === 'down' ? ' is-down' : ''}" id="${esc(t.id)}">${head}
   <p class="last${last.ok ? '' : ' bad'}">Last probe ${when}${last.ok ? '' : ' failed'}: ${result}</p>${stale}
-  <div class="hero">
-    <p><span class="num">${avail === null ? 'No data' : esc(pct(avail))}</span> <span class="cap">availability, 30 days</span></p>
-    ${verdict(avail, t.slo, 'SLO')}
-  </div>
-  <div class="budget ${b.tone}">
-    <p class="row"><span class="cap">Error budget</span><span>${b.text}</span></p>
-    <div class="bar" aria-hidden="true">${b.bar}</div>
+  <div class="kpis">${kpi(v.avail === null ? 'none' : v.avail >= t.slo ? 'good' : 'bad', 'Availability, 30 days',
+    v.avail === null ? 'No data' : pct(v.avail), verdict(v.avail, t.slo, 'SLO'))}${kpi(b.tone, 'Error budget left',
+    b.value, `${note(b.tone, b.text)}<div class="bar" aria-hidden="true">${b.bar}</div>`)}${kpi(b24, 'Burn rate, last 24 h',
+    v.burn24 === null ? 'No data' : rate(v.burn24), `${note(b24, BURN[b24])}${hour}<p class="s">1.0x = on pace to spend the budget in exactly 30 days</p>`)}${kpi(newest[1], 'Newest probe',
+    newest[0], note(newest[1], newest[2]))}
   </div>
   <dl class="minor">
-    <div><dt>Latency, 30 days</dt>
-      <dd><b>${lat === null ? 'No data' : esc(pct(lat))}</b> under ${esc(dur(t.threshold))} ${verdict(lat, t.latencySlo, 'target')}</dd></div>
-    <div><dt>p95, last 24 h</dt>
-      <dd><b>${p95 === null ? 'No data' : esc(dur(p95))}</b> good probes only</dd></div>
-  </dl>${strip(t, days, now)}
+    <div><dt>p95, last 24 h</dt><dd><b>${esc(v.p95 === null ? 'No data' : dur(v.p95))}</b> good probes only</dd></div>
+    <div><dt>Latency SLI, 30 days</dt><dd><b>${esc(v.lat === null ? 'No data' : pct(v.lat))}</b> under ${esc(dur(t.threshold))}${verdict(v.lat, t.latencySlo, 'target')}</dd></div>
+    <div><dt>Probed</dt><dd>${esc(EVERY[t.cron] ?? t.cron)} from ${t.source ? 'GitHub Actions' : 'Cloudflare'}</dd></div>
+    <div><dt>Window</dt><dd>${esc(WINDOW_DAYS)} UTC days, ${esc(v.cal.filter(({ d }) => d).length)} with data</dd></div>
+  </dl>
+  <div class="charts">${burndownChart(v)}${latencyChart(v, now)}
+  </div>${history(v)}${v.left === null ? '' : table(v)}
 </section>`;
 }
 
 // Favicon dot in the overall tone. Hex is spelled out: a data: URI cannot read CSS variables.
-const DOT = { good: '2e8b57', warn: 'c98a12', bad: 'b3301f', none: '8a8273' };
+const DOT = { good: '2e8b57', warn: 'b8800f', bad: 'b3301f', none: '8a8273' };
 const favicon = (tone) => "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
   + `%3Ccircle cx='8' cy='8' r='7' fill='%23${DOT[tone]}'/%3E%3C/svg%3E`;
 
 function renderPage(stats, now) {
-  const { tone, head, notes } = overall(stats, now);
+  const views = stats.map((s) => derive(s, now));
+  const { tone, head, notes } = overall(views, now);
   // source is only ever 'github' for now.
   const probed = TARGETS.map((t) => `<li>${esc(new URL(t.url).host)}: ${esc(EVERY[t.cron] ?? t.cron)}`
     + ` from ${t.source ? 'GitHub Actions, not from Cloudflare' : 'Cloudflare'}, ${esc(dur(t.timeout))} timeout</li>`).join('');
@@ -330,14 +533,17 @@ function renderPage(stats, now) {
   /* Paper and ink from theoith.ink, so this reads as part of the same site. */
   :root {
     --bg: #f2ead9; --card: #fffcf4; --text: #1c1a17; --muted: #5a5347; --line: #e2d8c3; --track: #ece3d0;
-    --link: #2b6b78;
-    --good: #2e8b57; --good-ink: #236b43; --warn: #c98a12; --warn-ink: #855600;
+    --link: #2b6b78; --axis: #b5a88e;
+    /* Warn is a step darker than the site's amber, so a warn mark clears 3:1 on a card. */
+    --good: #2e8b57; --good-ink: #236b43; --warn: #b8800f; --warn-ink: #855600;
     --bad: #b3301f; --bad-ink: #9e2a1b; --none: #d8cdb6; --none-ink: #5a5347;
+    /* Data lines are ink. The link teal sits too close to the status green to share a chart. */
+    --series: var(--text);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #15130f; --card: #1f1c17; --text: #f2ead9; --muted: #b3a994; --line: #35302a; --track: #2e2a23;
-      --link: #7cc0cd;
+      --link: #7cc0cd; --axis: #5a5347;
       --good: #4caf7d; --good-ink: #86d4a6; --warn: #d9a441; --warn-ink: #f0c46e;
       --bad: #e06a55; --bad-ink: #f39a88; --none: #3d382f; --none-ink: #b3a994;
     }
@@ -345,83 +551,147 @@ function renderPage(stats, now) {
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); overflow-wrap: break-word;
     font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 0 16px 40px; }
   p { margin: 0; }
   a { color: var(--link); text-underline-offset: 2px; }
   /* Teal, not red: red already means down on this page. */
-  a:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 3px; }
+  a:focus-visible, summary:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 4px; }
   .top { padding: 20px 0 4px; font-size: .9rem; }
   .top a { font-weight: 600; text-decoration: none; }
   .top a:hover { text-decoration: underline; }
   h1 { font-size: 1.75rem; line-height: 1.2; letter-spacing: -.01em; margin: 12px 0 4px; }
-  h2 { font-size: 1.15rem; line-height: 1.3; margin: 0; }
-  .sub, .host, .last, .cap, dt, .ends, .daysum, .legend, .meta, footer { color: var(--muted); }
-  .sub { margin-bottom: 20px; }
+  h2 { font-size: 1.3rem; line-height: 1.3; margin: 0; }
+  h3 { font-size: .95rem; line-height: 1.3; margin: 0; }
+  .sub, .host, .last, dt, .ends, .daysum, .meta, figcaption p, footer, .nodata { color: var(--muted); }
+  .sub { margin-bottom: 16px; }
 
-  /* One tone per state. Each element picks the swatch (--c) or the text shade (--ci). */
-  .good { --c: var(--good); --ci: var(--good-ink); }
-  .warn { --c: var(--warn); --ci: var(--warn-ink); }
-  .bad { --c: var(--bad); --ci: var(--bad-ink); }
-  .none { --c: var(--none); --ci: var(--none-ink); }
-  .dot { display: inline-block; flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--c); }
+  /* One tone per state. --c is the swatch, --ci the text shade, --on the glyph inside an icon. */
+  .good { --c: var(--good); --ci: var(--good-ink); --on: var(--card); }
+  .warn { --c: var(--warn); --ci: var(--warn-ink); --on: #1c1a17; }
+  .bad { --c: var(--bad); --ci: var(--bad-ink); --on: var(--card); }
+  .none { --c: var(--none); --ci: var(--none-ink); --on: var(--card); }
+  .icon { flex: none; width: 1em; height: 1em; }
+  .icon .f { fill: var(--c); }
+  .icon .g { fill: none; stroke: var(--on); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .icon .d { fill: none; stroke: var(--ci); stroke-width: 1.6; stroke-dasharray: 2.6 2.1; }
 
-  .banner { display: grid; gap: 4px; padding: 16px 18px; margin-bottom: 16px; border-radius: 10px;
+  /* 1. The whole page in words. */
+  .banner { display: grid; gap: 4px; padding: 16px 20px; margin-bottom: 16px; border-radius: 12px;
     border: 1px solid color-mix(in srgb, var(--c) 45%, var(--line));
     background: color-mix(in srgb, var(--c) 12%, var(--card)); }
-  .banner h2 { display: flex; align-items: center; gap: 10px; font-size: 1.25rem; }
+  .banner h2 { display: flex; align-items: center; gap: 10px; font-size: 1.45rem; }
   .meta { font-size: .85rem; }
 
-  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; list-style: none; padding: 0; margin: 0 0 12px; font-size: .8rem; }
-  .legend li { display: flex; align-items: center; gap: 6px; }
-  .legend .dot { width: 8px; height: 14px; border-radius: 2px; }
+  /* 2. Each service, scannable across one row. Only trouble gets a coloured edge. */
+  .tiles { list-style: none; padding: 0; margin: 0 0 28px; display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+  .tile { display: grid; gap: 2px; height: 100%; padding: 12px 16px 14px; border-radius: 10px; color: inherit; text-decoration: none;
+    background: var(--card); border: 1px solid var(--line); border-top: 4px solid var(--line); }
+  .tile.warn, .tile.bad { border-top-color: var(--c); }
+  .tile:hover { background: color-mix(in srgb, var(--text) 4%, var(--card)); }
+  .tile .state { display: flex; align-items: center; gap: 6px; font-size: .85rem; font-weight: 650; color: var(--ci); }
+  .tile .name { font-size: 1.1rem; font-weight: 650; }
+  .tile .figs { display: flex; flex-wrap: wrap; gap: 0 16px; font-size: .85rem; color: var(--muted); }
+  .tile .figs b { color: var(--text); font-size: 1rem; font-weight: 650; }
 
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px; margin-bottom: 14px; }
-  .card.is-down { border-color: var(--bad); }
-  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  /* 3. One panel per service: state, then SLO numbers, then charts, then raw numbers. */
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 24px 22px;
+    margin-bottom: 20px; scroll-margin-top: 12px; }
+  .panel.is-down { border-color: var(--bad); }
+  .phead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   .host { font-size: .9rem; }
-  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; white-space: nowrap;
-    font-size: .8rem; font-weight: 650; color: var(--ci); background: color-mix(in srgb, var(--c) 16%, var(--card));
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+    font-size: .85rem; font-weight: 650; color: var(--ci); background: color-mix(in srgb, var(--c) 16%, var(--card));
     border: 1px solid color-mix(in srgb, var(--c) 45%, transparent); }
-  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
   .last { font-size: .9rem; margin-top: 8px; overflow-wrap: anywhere; }
   .last.bad { color: var(--ci); }
 
-  .hero { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 4px 16px; margin: 16px 0; }
-  .num { display: block; font-size: 2.5rem; font-weight: 700; line-height: 1.1; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-  .cap { font-size: .85rem; }
-  .verdict { color: var(--ci); font-weight: 600; font-size: .9rem; }
-
-  .budget .row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; font-size: .9rem; margin-bottom: 6px; }
-  .budget b { color: var(--ci); font-variant-numeric: tabular-nums; }
-  .bar { height: 8px; border-radius: 999px; background: var(--track); overflow: hidden; }
+  .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+  .kpi { display: grid; align-content: start; gap: 4px; min-width: 0; padding: 12px 14px 14px; border-radius: 10px;
+    border: 1px solid var(--line); border-top: 3px solid var(--line); }
+  .kpi.warn, .kpi.bad { border-top-color: var(--c); }
+  .kpi .k { font-size: .8rem; color: var(--muted); }
+  .kpi .v { font-size: 1.75rem; font-weight: 650; line-height: 1.15; letter-spacing: -.01em; }
+  .s { display: flex; align-items: flex-start; gap: 6px; font-size: .8rem; line-height: 1.35; color: var(--muted); }
+  .s .icon { margin-top: .15em; }
+  .s.good, .s.warn, .s.bad { color: var(--ci); font-weight: 600; }
+  .bar { height: 6px; margin-top: 4px; border-radius: 999px; background: var(--track); overflow: hidden; }
   .bar span { display: block; height: 100%; background: var(--c); }
   /* Overspent: a full bar, striped, so it does not read as a full budget. */
   .bar .over { width: 100%; background: repeating-linear-gradient(135deg, var(--bad) 0 6px, transparent 6px 10px); }
 
-  .minor { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 24px;
-    margin: 16px 0; padding-top: 14px; border-top: 1px solid var(--line); }
-  dt { font-size: .8rem; }
-  dd { margin: 0; }
-  dd b { font-size: 1.1rem; margin-right: 4px; font-variant-numeric: tabular-nums; }
-  dd .verdict { display: block; font-size: .85rem; }
+  .minor { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 24px; margin: 14px 0 0; padding: 0 2px; }
+  dt { font-size: .75rem; }
+  dd { margin: 0; font-size: .85rem; color: var(--muted); }
+  dd b { color: var(--text); font-size: 1rem; font-weight: 650; margin-right: 4px; }
+  dd .s { margin-top: 2px; }
 
-  .strip { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); gap: 3px; height: 34px; }
+  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
+  .chart { margin: 0; min-width: 0; padding: 14px 16px 12px; border: 1px solid var(--line); border-radius: 10px; }
+  .chart.wide { margin-top: 16px; }
+  figcaption p { font-size: .8rem; }
+  .plot { position: relative; height: 160px; margin-top: 12px; }
+  .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .plot path { fill: none; vector-effect: non-scaling-stroke; }
+  .grid { stroke: var(--line); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+  /* Dashed only for the two reference lines, never for grid or axes. */
+  .pace, .thr { stroke: var(--muted); stroke-width: 1.25; stroke-dasharray: 4 4; }
+  .ln { stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .ln.warn, .dot.warn { stroke: var(--warn); }
+  .ln.bad, .dot.bad, .fail { stroke: var(--bad); }
+  .plot .wash { fill: var(--series); fill-opacity: .07; }
+  .plot .wash.bad { fill: var(--bad); fill-opacity: .16; }
+  .ring { stroke: var(--card); stroke-width: 12; stroke-linecap: round; }
+  .dot { stroke: var(--series); stroke-width: 8; stroke-linecap: round; }
+  .fail { stroke-width: 2; }
+  .hit { fill: transparent; }
+  .hit:hover { fill: color-mix(in srgb, var(--text) 8%, transparent); }
+  .lbl { position: absolute; left: 0; transform: translateY(-100%); padding: 0 4px 2px 0; font-size: .75rem; line-height: 1.2;
+    color: var(--muted); white-space: nowrap; background: color-mix(in srgb, var(--card) 85%, transparent); pointer-events: none; }
+  .lbl.end { left: auto; right: 0; padding: 0 0 2px 4px; transform: translateY(calc(-100% - 8px)); color: var(--text); font-weight: 650; }
+  .lbl.end.below { transform: translateY(8px); }
+  .lbl.end.bad { color: var(--bad-ink); }
+  .nodata { font-size: .9rem; padding: 40px 0; text-align: center; }
+
+  .strip { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); gap: 3px; height: 34px; margin-top: 12px; }
   .strip span { border-radius: 2px; background: var(--c); }
   .strip span:hover { opacity: .7; }
+  /* No data is hollow and dashed, like the no-data icon, so it is not a colour to learn. */
+  .strip span.none, .sw.none { background: transparent; border: 1.5px dashed color-mix(in srgb, var(--muted) 60%, transparent); }
   .ends { display: flex; justify-content: space-between; font-size: .75rem; margin-top: 4px; }
-  .daysum { font-size: .85rem; margin-top: 6px; }
+  .daysum { font-size: .85rem; margin-top: 8px; }
+  .key { white-space: nowrap; }
+  .sw { display: inline-block; width: 9px; height: 13px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; background: var(--c); }
+
+  .raw { margin-top: 14px; font-size: .85rem; }
+  summary { cursor: pointer; color: var(--link); font-weight: 600; }
+  .scroll { overflow-x: auto; margin-top: 8px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; }
+  th { font-weight: 600; font-size: .78rem; color: var(--muted); }
 
   .empty { display: grid; gap: 6px; margin-top: 14px; padding: 14px 16px; border-radius: 8px; font-size: .9rem;
     color: var(--muted); border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent); }
   .empty b { color: var(--text); }
 
-  footer { display: grid; gap: 8px; font-size: .85rem; border-top: 1px solid var(--line); margin-top: 24px; padding-top: 16px; }
+  /* 4. How it is measured, collapsed at the bottom. */
+  footer { display: grid; gap: 10px; font-size: .85rem; border-top: 1px solid var(--line); margin-top: 24px; padding-top: 16px; }
+  footer details > div { display: grid; gap: 8px; margin-top: 10px; }
   footer ul { margin: 0; padding-left: 20px; }
 
+  @media (max-width: 760px) {
+    .kpis, .minor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .charts { grid-template-columns: minmax(0, 1fr); }
+  }
   @media (max-width: 480px) {
     h1 { font-size: 1.5rem; }
-    .card { padding: 16px; }
-    .num { font-size: 2.1rem; }
+    .banner h2 { font-size: 1.25rem; }
+    .panel { padding: 16px; }
+    .kpi { padding: 10px 12px 12px; }
+    .kpi .v { font-size: 1.4rem; }
+    .chart { padding: 12px; }
     .strip { gap: 2px; height: 28px; }
   }
 </style>
@@ -433,30 +703,36 @@ function renderPage(stats, now) {
   <h1>Uptime and SLOs</h1>
   <p class="sub">Availability and latency against written SLOs, over a rolling 30-day window in UTC days.</p>
   <section class="banner ${tone}" aria-labelledby="overall">
-    <h2 id="overall"><span class="dot"></span>${esc(head)}</h2>
+    <h2 id="overall">${icon(tone)}${esc(head)}</h2>
     ${notes.length ? `<p>${esc(notes.join(' '))}</p>` : ''}
     <p class="meta">Page built <time datetime="${esc(new Date(now).toISOString())}">${esc(stamp(now))}</time>. It reloads itself every minute.</p>
   </section>
-  <ul class="legend" aria-label="Colours in the daily bars">
-    <li><span class="dot good"></span>Met the SLO</li>
-    <li><span class="dot warn"></span>Missed</li>
-    <li><span class="dot bad"></span>Missed badly, over 10x the allowed failures</li>
-    <li><span class="dot none"></span>No data</li>
+  <ul class="tiles" aria-label="Services at a glance">${views.map(tile).join('')}
   </ul>
-  ${stats.map((s) => card(s, now)).join('')}
+  ${views.map((v) => panel(v, now)).join('')}
 </main>
 <footer>
-  <p>What is probed, and how often. A probe is up when the site answers 2xx within the timeout.
-    The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.
-    Stale means no probe has arrived for ${esc(STALE_AFTER)} of its intervals, so its current state is unknown.</p>
-  <ul>${probed}</ul>
+  <p>The two Cloudflare-hosted sites are probed from Cloudflare, so this page shares fate with them:
+    a Cloudflare outage can take those sites, this page and the alerts down together.</p>
   ${PAUSED.map((t) => `<p>Paused: ${esc(t.name)} (${esc(new URL(t.url).host)}). ${esc(t.why)}</p>`).join('')}
-  <p>The two Cloudflare-hosted sites are probed by a Cloudflare Cron Trigger, from whichever Cloudflare data center
-    picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
-    those sites and this page can go down together, and no alert goes out.</p>
-  <p>Hulog is probed by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
-    onrender.com blocks requests from Cloudflare Workers, so a probe from Cloudflare would measure that block, not Hulog.
-    GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
+  <details>
+    <summary>How this is measured</summary>
+    <div>
+      <p>What is probed, and how often. A probe is up when the site answers 2xx within the timeout.
+        The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.
+        Stale means no probe has arrived for ${esc(STALE_AFTER)} of its intervals, so its current state is unknown.</p>
+      <ul>${probed}</ul>
+      <p>The error budget is the number of probes allowed to fail in a full 30-day window, (1 &minus; SLO) &times; the window's probes,
+        so a failure on day one costs what it would on day 30. The burndown starts the window at 100% and drops with each failed probe.
+        Burn rate is the error rate over a recent window divided by the rate the SLO allows: 1.0x would spend the budget in exactly 30 days.</p>
+      <p>The two Cloudflare-hosted sites are probed by a Cloudflare Cron Trigger, from whichever Cloudflare data center
+        picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
+        those sites and this page can go down together, and no alert goes out.</p>
+      <p>Hulog is probed by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
+        onrender.com blocks requests from Cloudflare Workers, so a probe from Cloudflare would measure that block, not Hulog.
+        GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
+    </div>
+  </details>
 </footer>
 </div>
 </body>

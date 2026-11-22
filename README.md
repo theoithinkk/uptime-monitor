@@ -43,9 +43,9 @@ A target goes **Stale** on the page when its newest probe is older than 3 of its
 | File | Purpose |
 |---|---|
 | `src/index.js` | The Worker: targets, probing, `/ingest`, D1 writes, alerts and the status page |
-| `src/slo.js` | Pure SLO math: SLI ratios, error budget, p95 and the alert decision |
+| `src/slo.js` | Pure SLO math: SLI ratios, error budget, burndown, burn rate, p95 and the alert decision |
 | `test/slo.test.js` | Unit tests for `slo.js`, run with Node's built-in test runner |
-| `test/page.test.js` | Status page tests against a fake D1: escaping, the CSP, the Stale state |
+| `test/page.test.js` | Status page tests against a fake D1: escaping, the CSP, the Stale state, the burndown and burn rate |
 | `test/ingest.test.js` | `/ingest` tests against a fake D1, and a check that the cron never probes Hulog |
 | `.github/workflows/probe-hulog.yml` | The hourly Hulog probe on GitHub Actions |
 | `schema.sql` | The two D1 tables, `probes` and `daily` |
@@ -169,7 +169,7 @@ GitHub turns off scheduled workflows in a public repo after 60 days with no acti
 
 **D1, not KV.** KV's free plan allows 1,000 writes a day. This needs about 1,200: 600 probes a day, two writes each. KV also can't sum or sort, and it is eventually consistent, while the alert check reads back the rows it just wrote. D1 is SQLite, allows 100,000 writes a day for free, and can sort rows and bump counters in SQL.
 
-**Daily rollups.** D1's free plan allows 5 million rows read a day. Working out 30-day SLOs from raw rows means reading about 18,000 rows on every page view, which allows only about 270 views a day. The `daily` table keeps one row per target per day, so a page view reads about 700 rows: 30 daily rows per target, plus 24 hours of raw rows for p95. Each page query filters on the table's primary key prefix (`target`), so SQLite reads only the rows it needs and never scans the whole table.
+**Daily rollups.** D1's free plan allows 5 million rows read a day. Working out 30-day SLOs from raw rows means reading about 18,000 rows on every page view, which allows only about 270 views a day. The `daily` table keeps one row per target per day, so a page view reads about 700 rows: 30 daily rows per target, plus 24 hours of raw rows for the p95, the latency chart and the burn rates. Each page query filters on the table's primary key prefix (`target`), so SQLite reads only the rows it needs and never scans the whole table.
 
 **Hulog is probed hourly.** Hulog runs on Render's free tier, which sleeps after 15 idle minutes. A 5-minute probe would keep it awake all the time. That would use about 720 of the 750 free hours a month, and it would hide the cold start real users hit. Hourly probes mostly find it asleep, so Hulog's latency SLI is really a cold-start SLI. The run is at minute 7, not 0, because GitHub starts on-the-hour jobs late, when most scheduled workflows fire at once. The 90 second timeout fits inside the job's 5 minute limit.
 

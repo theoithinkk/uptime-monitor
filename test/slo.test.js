@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
-  budgetRemaining, budgetMinutes, percentile, alertFor,
+  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown,
 } from '../src/slo.js';
 
 const close = (actual, expected, eps = 1e-9) =>
@@ -34,6 +34,35 @@ test('error budget: 99.9% over 8640 probes with 4 bad leaves about 53.7%', () =>
 test('error budget in minutes', () => {
   close(budgetMinutes(0.999), 43.2);
   close(budgetMinutes(0.99), 432); // Hulog: 7.2 hourly probes
+});
+
+test('burn rate: 1 is exactly on pace, failures in a short window burn fast', () => {
+  close(burnRate(1000, 1, 0.999), 1); // 0.1% errors against a 0.1% allowance
+  assert.equal(burnRate(288, 0, 0.999), 0);
+  close(burnRate(12, 9, 0.999), 750); // 9 of the last 12 probes failed
+  close(burnRate(24, 1, 0.99), 1 / 24 / 0.01); // Hulog: one failed hourly probe in a day
+  assert.equal(burnRate(0, 0, 0.999), null);
+  assert.equal(burnRate(10, 0, 1), null); // a 100% SLO allows no errors, so no rate
+});
+
+test('burndown: budget left after each day, flat on days with no data, never clamped', () => {
+  const allowed = 0.001 * 30 * 288; // 8.64 probes, the full-window budget
+  const bads = Array(30).fill(0);
+  bads[4] = 1;
+  bads[11] = 1;
+  const left = burndown(bads, allowed);
+  assert.equal(left.length, 30);
+  close(left[3], 1);
+  close(left[4], 1 - 1 / 8.64);
+  close(left[10], left[4]); // nothing spent in between
+  // The last point is the headline figure on the page.
+  close(left[29], budgetRemaining(0.999, 30 * 288, 2));
+
+  const over = burndown([0, 3, 18], allowed);
+  close(over[1], 1 - 3 / 8.64);
+  close(over[2], 1 - 21 / 8.64);
+  assert.ok(over[2] < -1, 'overspend goes below zero');
+  assert.equal(burndown([1], 0), null);
 });
 
 test('nearest-rank p95', () => {
