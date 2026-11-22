@@ -56,6 +56,44 @@ export function burndown(bads, allowed) {
   return bads.map((bad) => 1 - (spent += bad) / allowed);
 }
 
+// Burn rate for each hour of a window, oldest first, for a sparkline. probes are
+// { ts, ok }; hour i covers [start + i h, start + (i + 1) h). An hour with fewer
+// than min probes is null: one failure in two probes is not a rate worth drawing.
+export function hourlyBurn(probes, slo, start, hours, min) {
+  const HOUR = 60 * 60 * 1000;
+  const n = Array(hours).fill(0);
+  const bad = Array(hours).fill(0);
+  for (const p of probes) {
+    const i = Math.floor((p.ts - start) / HOUR);
+    if (i < 0 || i >= hours) continue;
+    n[i]++;
+    if (!p.ok) bad[i]++;
+  }
+  return n.map((total, i) => (total < min ? null : burnRate(total, bad[i], slo)));
+}
+
+// The fleet summary: the service that is worst on each SLO number, so the top of
+// the page says where to look first. items are { avail, slo, left, burn } plus
+// anything the caller wants back, with null for no data; null never wins. Ties keep
+// the first item. lowest ranks by distance from each service's own goal, so a 99%
+// service at 99.5% is better off than a 99.9% service at 99.8%.
+export function fleet(items) {
+  const worst = (score) => {
+    let pick = null;
+    let low = Infinity;
+    for (const x of items) {
+      const s = score(x);
+      if (s !== null && s < low) [pick, low] = [x, s];
+    }
+    return pick;
+  };
+  return {
+    lowest: worst((x) => (x.avail === null ? null : x.avail - x.slo)),
+    atRisk: worst((x) => x.left),
+    hottest: worst((x) => (x.burn === null ? null : -x.burn)),
+  };
+}
+
 // Nearest-rank percentile, p in 1..100. The answer is always a real sample.
 export function percentile(values, p) {
   if (values.length === 0) return null;

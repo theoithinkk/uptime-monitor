@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
   budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown, failingSince,
+  hourlyBurn, fleet,
 } from '../src/slo.js';
 
 const close = (actual, expected, eps = 1e-9) =>
@@ -101,4 +102,32 @@ test('outage start: first failure of the newest failed run', () => {
   assert.deepEqual(failingSince([p(1, 0), p(2, 1), p(3, 0), p(4, 0)]), { ts: 3, whole: false });
   // Every probe failed: it started at or before the oldest one shown.
   assert.deepEqual(failingSince([p(1, 0), p(2, 0)]), { ts: 1, whole: true });
+});
+
+test('hourly burn: one rate per hour, null where too few probes to rate', () => {
+  const H = 3_600_000;
+  const start = 1_000_000;
+  // Hour 0: 12 probes, 3 failed. Hour 1: 2 probes. Hour 2: none. One probe falls before the window.
+  const probes = [{ ts: start - 1, ok: false },
+    ...Array.from({ length: 12 }, (_, i) => ({ ts: start + i * 300_000, ok: i >= 3 })),
+    { ts: start + H, ok: false }, { ts: start + H + 10, ok: true }];
+  const r = hourlyBurn(probes, 0.999, start, 3, 10);
+  assert.equal(r.length, 3);
+  close(r[0], 3 / 12 / 0.001); // 250x
+  assert.equal(r[1], null);
+  assert.equal(r[2], null);
+});
+
+test('fleet summary picks the worst service on each number, never one with no data', () => {
+  const a = { name: 'a', avail: 0.9995, slo: 0.999, left: 0.5, burn: 0.2 };
+  const b = { name: 'b', avail: 0.996, slo: 0.99, left: -0.2, burn: null };
+  const c = { name: 'c', avail: null, slo: 0.999, left: null, burn: 4 };
+  const f = fleet([a, b, c]);
+  // b is lower in raw terms, but further above its own 99% goal than a is above 99.9%.
+  assert.equal(f.lowest, a);
+  assert.equal(f.atRisk, b);
+  assert.equal(f.hottest, c);
+  assert.deepEqual(fleet([]), { lowest: null, atRisk: null, hottest: null });
+  // Ties keep the first.
+  assert.equal(fleet([{ ...a, name: 'x' }, a]).lowest.name, 'x');
 });

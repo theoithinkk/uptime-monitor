@@ -50,8 +50,8 @@ test('status page with no probes at all says it is waiting', async () => {
   assert.match(html, /No checks yet/);
 });
 
-// The panel for one service, so a badge check cannot match another panel.
-const cardOf = (html, name) => html.split('<section class="panel').find((s) => s.includes(`<h2>${name}</h2>`));
+// The section for one service, so a badge check cannot match another service.
+const cardOf = (html, name) => html.split('<section class="svc').find((s) => s.includes(`<h2>${name}</h2>`));
 
 test('burndown, burn rate and badges on a service that is down and overspent', async () => {
   const now = Date.now();
@@ -76,6 +76,12 @@ test('burndown, burn rate and badges on a service that is down and overspent', a
   assert.match(w, /1\.0x = on pace/);
   // The latency line breaks at failures and marks each one with a tick.
   assert.equal((w.match(/V88/g) ?? []).length, 9);
+  // The top row names the worst service on each number and links down to it.
+  const top = html.slice(html.indexOf('aria-labelledby="fleet"'), html.indexOf('<section class="svc'));
+  assert.match(top, /Services up[^]*?0 <small>of 3<\/small>/);
+  assert.match(top, /Lowest up time[^]*?25\.00%[^]*?href="#writeups">CTF writeups</);
+  assert.match(top, /Least allowance left[^]*?4\.2% <small>over<\/small>[^]*?Overspent/);
+  assert.match(top, /Fastest spending, 1 h[^]*?750x[^]*?Over 10x the pace/);
 });
 
 test('a probe older than 3 intervals is Stale, never Up, and the banner counts it', async () => {
@@ -120,7 +126,7 @@ test('a healthy service leads with one plain sentence built from its numbers', a
 test('?open= opens one known panel, and its value never reaches the page', async () => {
   const data = { writeups: { probes: [{ ts: Date.now() - 60_000, ok: 1, status: 200, ms: 150, err: null }], days: [] } };
   const { html } = await page(data, '/?open=writeups');
-  assert.match(html, /<section class="panel good open" id="writeups">/);
+  assert.match(html, /<section class="svc good open" id="writeups">/);
   assert.equal((html.match(/ open"/g) ?? []).length, 1);
   // The refresh keeps the selection and never has a #fragment: Chromium treats a
   // refresh to a URL with one as a scroll within the page and stops reloading.

@@ -1,6 +1,7 @@
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
   budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown, failingSince,
+  hourlyBurn, fleet,
 } from './slo.js';
 
 // What gets probed. Hardcoded on purpose: no request can make this Worker
@@ -169,6 +170,7 @@ const dur = (ms) => (ms < 1000 ? `${ms} ms` : `${+(ms / 1000).toFixed(1)} s`);
 const stamp = (ts) => `${new Date(ts).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 const rate = (x) => `${x.toFixed(x < 10 ? 1 : 0)}x`;
 const leftText = (v) => (v >= 0 ? `${pct(v, 1)} left` : `overspent by ${pct(-v, 1)}`);
+const int = (n) => n.toLocaleString('en-US'); // 8352 -> 8,352
 // Chart coordinates. Numbers only, escaped anyway so every value takes the same path.
 const num = (x) => esc((+x).toFixed(2));
 
@@ -181,7 +183,7 @@ function span(ms) {
 }
 const ago = (ms) => `${span(ms)} ago`;
 
-// One rule colours a day in the strip and a recent burn rate: good while it spends
+// One rule colours a day in the chart and a recent burn rate: good while it spends
 // budget no faster than the SLO allows (burn rate up to 1), bad past 10 times that.
 const toneOf = (burn) => (burn === null ? 'none' : burn <= 1 ? 'good' : burn <= 10 ? 'warn' : 'bad');
 const LEVEL = { good: 'good', warn: 'missed the goal', bad: 'far below the goal', none: 'no data' };
@@ -225,7 +227,7 @@ function overall(stats, now) {
   return { tone: 'good', head: none.length ? 'All checked services operational' : 'All services operational', notes };
 }
 
-// Everything the panel shows for one service, worked out once.
+// Everything the panels show for one service, worked out once.
 function derive(s, now) {
   const { t, days, recent } = s;
   const state = stateOf(s, now);
@@ -244,11 +246,14 @@ function derive(s, now) {
   };
   return {
     ...s, state, tone: STATE[state][0], label: STATE[state][1], cal,
+    checks: w.total, failed: w.total - w.good,
     avail: availability(w), lat: latency(w),
     left: w.total ? budgetRemaining(t.slo, perWindow, w.total - w.good) : null,
     series: burndown(cal.map(({ d }) => (d ? d.total - d.good : 0)), (1 - t.slo) * perWindow),
     p95: percentile(recent.filter((p) => p.ok).map((p) => p.ms), 95),
     burn24: burn(now - DAY_MS), burn1: burn(now - HOUR_MS),
+    // Rolling hours ending now, so the last one is exactly the 1 h rate.
+    hourly: hourlyBurn(recent, t.slo, now - DAY_MS, 24, BURN_MIN_PROBES),
   };
 }
 
@@ -276,7 +281,7 @@ function budget(t, left) {
 }
 
 // The first thing a visitor reads about a service, built from the same numbers as
-// the figures below it, so the words and the numbers can never disagree.
+// the panels under it, so the words and the numbers can never disagree.
 function sentence(v, now) {
   const { t, last, left } = v;
   const fail = failingSince(v.recent);
@@ -295,32 +300,88 @@ function sentence(v, now) {
 }
 
 const note = (tone, text) => `<p class="s ${tone}">${icon(tone)}<span>${esc(text)}</span></p>`;
-// An at-a-glance number: plain label, the SRE term small, the value (HTML), a note.
-// A value that is words, not a number ("No answer"), is set smaller so it fits one line.
-const fig = (tone, label, term, value, extra) => `
-    <div class="fig ${tone}"><p class="k">${esc(label)} <small>${esc(term)}</small></p><p class="v${/^\d/.test(value) ? '' : ' word'}">${value}</p>${extra}</div>`;
 // A detail row for the SRE view. value is HTML.
 const row = (label, term, value, extra = '') => `
       <div><dt>${esc(label)}${term ? ` <small>${esc(term)}</small>` : ''}</dt><dd><b>${value}</b>${extra}</dd></div>`;
+// A smaller figure under a panel's headline one. value is HTML; tone adds its icon,
+// and why is the hover text that says what the icon means.
+const sub = (label, value, tone = '', why = '') => `
+          <div><dt>${esc(label)}</dt><dd${tone ? ` class="${tone}"` : ''}${why ? ` title="${esc(why)}"` : ''}>${tone ? icon(tone) : ''}<b>${value}</b></dd></div>`;
 
-// Plots are drawn in a 100 x 100 box stretched to the container, so the same
-// numbers place the HTML labels as percentages. Strokes keep their width
-// (vector-effect in the CSS), and the labels are HTML so they never stretch.
-function figure(title, term, caption, body) {
+// One SLO panel: a plain title with the SRE term small, its window, the headline
+// figure and its verdict, two smaller figures with one line on what they mean, then
+// the chart. The three parts sit on the row's subgrid, so a row's charts line up.
+function pnl(cls, title, term, win, value, verdict, subs, hint, viz) {
   return `
-    <figure class="chart">
-      <figcaption><h3>${title} <small>${term}</small></h3><p>${caption}</p></figcaption>${body}
-    </figure>`;
+      <div class="pnl ${cls}">
+        <div class="top">
+          <div class="ph"><h3>${esc(title)} <small>${esc(term)}</small></h3><span class="win">${esc(win)}</span></div>
+          <p class="v${/^\d/.test(value) ? '' : ' word'}">${value}</p>${verdict}
+        </div>
+        <div class="sub"><dl>${subs}
+        </dl><p class="hint">${hint}</p></div>${viz}
+      </div>`;
+}
+
+// Every chart has the same frame: a caption, a lane of y labels on the left, the
+// plot, and the window's ends under it. Plots are drawn in a 100 x 100 box stretched
+// to the plot area, so the same numbers place the HTML labels as percentages.
+// Strokes keep their width (vector-effect in the CSS), and labels never stretch.
+// caption and body are HTML; ticks are [y %, text] pairs.
+function chart(caption, ticks, body, ends, after = '') {
+  return `
+        <figure class="chart">
+          <figcaption>${caption}</figcaption>
+          <div class="plot">
+            <div class="yax" aria-hidden="true">${ticks.map(([y, text]) => `<span style="top:${num(y)}%">${esc(text)}</span>`).join('')}</div>${body}
+          </div>
+          <div class="ends" aria-hidden="true">${ends.map((e) => `<span>${esc(e)}</span>`).join('')}</div>${after}
+        </figure>`;
+}
+const noChart = (caption, why) => `
+        <figure class="chart"><figcaption>${caption}</figcaption><p class="nodata">${esc(why)}</p></figure>`;
+
+// 30 daily bars against the goal, oldest first. The scale runs from 100% down to
+// five times the allowed failure rate, so the goal sits a fifth of the way down and a
+// 99.95% day still looks nearly full. A day below that floor keeps a stub; its tooltip
+// and the daily table give the number. A missed day is also a shorter bar, so the
+// chart still reads without colour. The bars are hidden from screen readers: the key
+// under them carries the same facts, and the table in the details every number.
+function availChart(v) {
+  const { t, cal } = v;
+  const floor = 1 - 5 * (1 - t.slo);
+  const y = (a) => (1 - Math.max(0, (a - floor) / (1 - floor))) * 100;
+  const count = { good: 0, warn: 0, bad: 0, none: 0 };
+  let worst = null;
+  const bars = cal.map(({ day, d }) => {
+    if (!d) {
+      count.none++;
+      return `<span class="none" title="${esc(day)}: no data"></span>`;
+    }
+    const a = d.good / d.total;
+    const tone = toneOf(burnRate(d.total, d.total - d.good, t.slo));
+    count[tone]++;
+    if (tone !== 'good' && (!worst || a < worst.a)) worst = { day, a };
+    return `<span class="${tone}" style="height:${num(100 - y(a))}%" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} checks, ${LEVEL[tone]}`)}"></span>`;
+  }).join('');
+  const key = Object.keys(count).filter((k) => count[k])
+    .map((k) => `<span class="key"><i class="sw ${k}" aria-hidden="true"></i>${esc(`${count[k]} ${LEVEL[k]}`)}</span>`).join('');
+  return { worst, chart: chart(`Each UTC day. Dashed: the ${esc(target(t.slo))} goal.`,
+    [[0, '100%'], [y(t.slo), target(t.slo)], [100, target(floor)]], `
+            <div class="area bars" aria-hidden="true">${bars}</div>
+            <i class="goal" style="top:${num(y(t.slo))}%" aria-hidden="true"></i>`,
+    [cal[0].day, 'Today'], `
+          <p class="daysum">${key}</p>`) };
 }
 
 function burndownChart(v) {
   const { t, cal, series } = v;
-  const head = ['Downtime allowance, 30 days', 'error budget burndown',
-    'What was left after each day. Dashed: using it exactly on pace (1.0x).'];
-  if (v.left === null) return figure(...head, '<p class="nodata">No checks in the window yet.</p>');
+  const cap = esc('What was left after each day. Dashed: spending it exactly on pace (1.0x).');
+  if (v.left === null) return noChart(cap, 'No checks in the window yet.');
   const end = series[series.length - 1]; // the burndown only falls, so this is also the lowest point
   const lo = Math.min(0, end);
-  const y = (val) => 14 + ((1 - val) / (1 - lo)) * 78; // room above 100% for its label, below 0 for air
+  // 100% on the top edge and the lowest point on the bottom one, like the other two charts.
+  const y = (val) => ((1 - val) / (1 - lo)) * 100;
   const pts = [[0, y(1)], ...series.map((val, i) => [((i + 1) / WINDOW_DAYS) * 100, y(val)])];
   const line = `M${pts.map(([a, b]) => `${num(a)} ${num(b)}`).join('L')}`;
   const z = y(0);
@@ -331,37 +392,33 @@ function burndownChart(v) {
   const hits = cal.map(({ day, d }, i) => `<rect class="hit" x="${num((i * 100) / WINDOW_DAYS)}" y="0" width="${num(100 / WINDOW_DAYS)}" height="100">`
     + `<title>${esc(`${day}: ${d ? `${d.total - d.good} failed of ${d.total} checks` : 'no data'}, budget ${leftText(series[i])}`)}</title></rect>`).join('');
   const over = end < 0 ? ' bad' : '';
-  return figure(...head, `
-      <div class="plot">
-        <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
-          <title id="${id}-t">Error budget left over the last 30 days</title>
-          <desc id="${id}-d">${esc(`From 100% on ${cal[0].day} to ${leftText(end)} today.${spent ? ` It ran out on ${spent}.` : ''}`)}</desc>
-          <defs>
-            <clipPath id="${id}-pos"><rect x="-5" y="-5" width="110" height="${num(z + 5)}"/></clipPath>
-            <clipPath id="${id}-neg"><rect x="-5" y="${num(z)}" width="110" height="${num(105 - z)}"/></clipPath>
-          </defs>
-          <path class="grid" d="M0 ${num(y(1))}H100"/>
-          <path class="wash" d="${area}" clip-path="url(#${id}-pos)"/>
-          <path class="wash bad" d="${area}" clip-path="url(#${id}-neg)"/>
-          <path class="pace" d="M0 ${num(y(1))}L100 ${num(z)}"/>
-          <path class="axis" d="M0 ${num(z)}H100"/>
-          <path class="ln" d="${line}" clip-path="url(#${id}-pos)"/>
-          <path class="ln bad" d="${line}" clip-path="url(#${id}-neg)"/>
-          <path class="ring" d="M100 ${yEnd}h0"/><path class="dot${over}" d="M100 ${yEnd}h0"/>
-          ${hits}
-        </svg>
-        <span class="lbl" style="top:${num(y(1))}%" aria-hidden="true">100%</span>
-        <span class="lbl" style="top:${num(z)}%" aria-hidden="true">0%, all used</span>
-        <span class="lbl end${over}${y(end) < 30 ? ' below' : ''}" style="top:${yEnd}%" aria-hidden="true">${esc(leftText(end))}</span>
-      </div>
-      <div class="ends" aria-hidden="true"><span>${esc(cal[0].day)}</span><span>Today</span></div>`);
+  return chart(cap, [[y(1), '100%'], [z, '0%']], `
+            <div class="area">
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
+                <title id="${id}-t">Error budget left over the last 30 days</title>
+                <desc id="${id}-d">${esc(`From 100% on ${cal[0].day} to ${leftText(end)} today.${spent ? ` It ran out on ${spent}.` : ''}`)}</desc>
+                <defs>
+                  <clipPath id="${id}-pos"><rect x="-5" y="-5" width="110" height="${num(z + 5)}"/></clipPath>
+                  <clipPath id="${id}-neg"><rect x="-5" y="${num(z)}" width="110" height="${num(105 - z)}"/></clipPath>
+                </defs>
+                <path class="grid" d="M0 ${num(y(1))}H100"/>
+                <path class="wash" d="${area}" clip-path="url(#${id}-pos)"/>
+                <path class="wash bad" d="${area}" clip-path="url(#${id}-neg)"/>
+                <path class="pace" d="M0 ${num(y(1))}L100 ${num(z)}"/>
+                <path class="axis" d="M0 ${num(z)}H100"/>
+                <path class="ln" d="${line}" clip-path="url(#${id}-pos)"/>
+                <path class="ln bad" d="${line}" clip-path="url(#${id}-neg)"/>
+                <path class="ring" d="M100 ${yEnd}h0"/><path class="dot${over}" d="M100 ${yEnd}h0"/>
+                ${hits}
+              </svg>
+              <span class="lbl end${over}${y(end) < 30 ? ' below' : ''}" style="top:${yEnd}%" aria-hidden="true">${esc(leftText(end))}</span>
+            </div>`, [cal[0].day, 'Today']);
 }
 
 function latencyChart(v, now) {
   const { t, recent } = v;
-  const head = ['Response time, 24 hours', 'latency',
-    `Each check, to the first response. Dashed: the ${esc(dur(t.threshold))} goal. Red ticks: failed checks.`];
-  if (!recent.length) return figure(...head, '<p class="nodata">No checks in the last 24 hours.</p>');
+  const cap = `Each check, to the first response. Dashed: the ${esc(dur(t.threshold))} goal, slower is shaded. Red ticks: failed checks.`;
+  if (!recent.length) return noChart(cap, 'No checks in the last 24 hours.');
   const start = now - DAY_MS;
   const good = recent.filter((r) => r.ok);
   const okMs = good.map((r) => r.ms);
@@ -402,58 +459,99 @@ function latencyChart(v, now) {
     : `${recent.length} checks, all failed.`;
   // Each line is written twice, clipped above and below the threshold. A <use> would
   // save the bytes, but Chrome then stretches its stroke despite non-scaling-stroke.
-  return figure(...head, `
-      <div class="plot">
-        <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
-          <title id="${id}-t">Response time over the last 24 hours</title>
-          <desc id="${id}-d">${esc(summary)}</desc>
-          <defs>
-            <clipPath id="${id}-hi"><rect x="-5" y="-5" width="110" height="${num(thr + 5)}"/></clipPath>
-            <clipPath id="${id}-lo"><rect x="-5" y="${num(thr)}" width="110" height="${num(105 - thr)}"/></clipPath>
-          </defs>
-          <path class="axis" d="M0 100H100"/>
-          <path class="thr" d="M0 ${num(thr)}H100"/>
-          <path class="ln" d="${line}" clip-path="url(#${id}-lo)"/>
-          <path class="ln warn" d="${line}" clip-path="url(#${id}-hi)"/>
-          ${dots ? `<path class="ring" d="${dots}"/><path class="dot" d="${dots}" clip-path="url(#${id}-lo)"/><path class="dot warn" d="${dots}" clip-path="url(#${id}-hi)"/>` : ''}
-          ${fails ? `<path class="fail" d="${fails}"/>` : ''}
-          ${hits}
-        </svg>
-        <span class="lbl" style="top:${num(thr)}%" aria-hidden="true">${esc(dur(t.threshold))} goal</span>
-      </div>
-      <div class="ends" aria-hidden="true"><span>24 h ago</span><span>Now</span></div>`);
+  return chart(cap, [[thr, dur(t.threshold)], [100, '0']], `
+            <div class="area">
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
+                <title id="${id}-t">Response time over the last 24 hours</title>
+                <desc id="${id}-d">${esc(summary)}</desc>
+                <defs>
+                  <clipPath id="${id}-hi"><rect x="-5" y="-5" width="110" height="${num(thr + 5)}"/></clipPath>
+                  <clipPath id="${id}-lo"><rect x="-5" y="${num(thr)}" width="110" height="${num(105 - thr)}"/></clipPath>
+                </defs>
+                <rect class="band" x="0" y="0" width="100" height="${num(thr)}"/>
+                <path class="axis" d="M0 100H100"/>
+                <path class="thr" d="M0 ${num(thr)}H100"/>
+                <path class="ln" d="${line}" clip-path="url(#${id}-lo)"/>
+                <path class="ln warn" d="${line}" clip-path="url(#${id}-hi)"/>
+                ${dots ? `<path class="ring" d="${dots}"/><path class="dot" d="${dots}" clip-path="url(#${id}-lo)"/><path class="dot warn" d="${dots}" clip-path="url(#${id}-hi)"/>` : ''}
+                ${fails ? `<path class="fail" d="${fails}"/>` : ''}
+                ${hits}
+              </svg>
+            </div>`, ['24 h ago', 'Now']);
 }
 
-// 30 daily bars, oldest first. The bars are hidden from screen readers; the key
-// under them carries the same facts, and the table in the details every number.
-// A missed day is also a shorter bar, so the strip still reads without colour.
-function history(v) {
-  const { t, cal } = v;
-  const count = { good: 0, warn: 0, bad: 0, none: 0 };
-  let worst = null;
-  const bars = cal.map(({ day, d }) => {
-    if (!d) {
-      count.none++;
-      return `<span class="none" title="${esc(day)}: no data"></span>`;
-    }
-    const a = d.good / d.total;
-    const tone = toneOf(burnRate(d.total, d.total - d.good, t.slo));
-    count[tone]++;
-    if (tone !== 'good' && (!worst || a < worst.a)) worst = { day, a };
-    return `<span class="${tone}" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} checks, ${LEVEL[tone]}`)}"></span>`;
-  }).join('');
-  const key = Object.keys(count).filter((k) => count[k])
-    .map((k) => `<span class="key"><i class="sw ${k}" aria-hidden="true"></i>${esc(`${count[k]} ${LEVEL[k]}`)}</span>`).join('');
-  return { worst, key, strip: `
-  <div class="days">
-    <p class="k">Last 30 days <small>daily availability, goal ${esc(target(t.slo))}</small></p>
-    <div class="strip" aria-hidden="true">${bars}</div>
-    <div class="ends" aria-hidden="true"><span>${esc(cal[0].day)}</span><span>Today</span></div>
-  </div>` };
+// A trend with no axes, beside a summary figure: a quiet line, its newest point in the
+// accent, null as a gap. The scale always reaches 0 and 1, which is the full budget for
+// a burndown and the on-pace rate for a burn rate, so both read against their own mark.
+function spark(vals, label) {
+  const real = vals.filter((x) => x !== null);
+  if (real.length < 2) return '';
+  const lo = Math.min(0, ...real);
+  const hi = Math.max(1, ...real);
+  const y = (x) => 8 + ((hi - x) / (hi - lo)) * 84;
+  let line = '';
+  let pen = 'M';
+  vals.forEach((x, i) => {
+    if (x === null) { pen = 'M'; return; }
+    line += `${pen}${num((i / (vals.length - 1)) * 100)} ${num(y(x))}`;
+    pen = 'L';
+  });
+  const last = vals[vals.length - 1];
+  const end = last === null ? '' : `<path class="ring" d="M100 ${num(y(last))}h0"/><path class="dot" d="M100 ${num(y(last))}h0"/>`;
+  return `<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="${esc(label)}">`
+    + `<path class="axis" d="M0 ${num(y(0))}H100"/><path class="sl" d="${line}"/>${end}</svg>`;
 }
 
-// The table twin of the strip and the burndown, newest day first. A scroll box, not a
-// <details>: the 60 s reload would close a <details> while someone reads it.
+const BURN = { good: 'Within the pace the SLO allows', warn: 'Faster than the SLO allows',
+  bad: 'Over 10x the pace the SLO allows', none: 'Too few checks for a rate' };
+
+// The top row: the worst service on each SLO number, so it says where to look first.
+// Each tile links down to the service it names.
+function summary(views) {
+  const live = views.filter((v) => v.last);
+  const f = fleet(live.map((v) => ({ v, avail: v.avail, slo: v.t.slo, left: v.left, burn: v.burn1 })));
+  const up = views.filter((v) => v.state === 'up' || v.state === 'slow').length;
+  const who = (x) => `<p class="who"><a href="#${esc(x.v.t.id)}">${esc(x.v.t.name)}</a></p>`;
+  const tile = (title, term, value, extra, sp = '') => `
+    <div class="kpi"><h3>${esc(title)} <small>${esc(term)}</small></h3>
+      <div class="vrow"><p class="v${/^\d/.test(value) ? '' : ' word'}">${value}</p>${sp}</div>${extra}
+    </div>`;
+
+  const list = views.map((v) => `<li class="${v.tone}"><a href="#${esc(v.t.id)}">${icon(v.tone)}${esc(v.t.name)}</a><span>${esc(v.label)}</span></li>`).join('');
+  const tiles = [tile('Services up', 'now', `${esc(up)} <small>of ${esc(views.length)}</small>`, `<ul class="fl">${list}</ul>`)];
+
+  const low = f.lowest;
+  tiles.push(low ? tile('Lowest up time', 'availability, 30 d', esc(pct(low.avail)),
+    `${who(low)}${note(low.avail >= low.slo ? 'good' : 'bad', `${low.avail >= low.slo ? 'Meets' : 'Below'} its ${target(low.slo)} goal`)}`)
+    : tile('Lowest up time', 'availability, 30 d', 'No data', note('none', 'No checks in the window yet')));
+
+  const risk = f.atRisk;
+  if (risk) {
+    const b = budget(risk.v.t, risk.left).tone;
+    const words = { good: 'Within budget', warn: 'Under a quarter left', bad: risk.left < 0 ? 'Overspent' : 'All used' };
+    tiles.push(tile('Least allowance left', 'error budget', risk.left < 0
+      ? `${esc(pct(-risk.left, 1))} <small>over</small>` : `${esc(pct(risk.left, 1))} <small>left</small>`,
+    `${who(risk)}${note(b, words[b])}`, spark(risk.v.series, `Budget left after each day for ${risk.v.t.name}, last 30 days`)));
+  } else {
+    tiles.push(tile('Least allowance left', 'error budget', 'No data', note('none', 'No checks in the window yet')));
+  }
+
+  const hot = f.hottest;
+  tiles.push(hot ? tile('Fastest spending, 1 h', 'burn rate', esc(rate(hot.burn)),
+    `${who(hot)}${note(toneOf(hot.burn), BURN[toneOf(hot.burn)])}`,
+    spark(hot.v.hourly, `Spending rate each hour for ${hot.v.t.name}, last 24 hours`))
+    : tile('Fastest spending, 1 h', 'burn rate', 'No data', note('none', 'Too few checks in the last hour')));
+
+  return `
+  <section class="row" aria-labelledby="fleet">
+    <h2 class="rowh" id="fleet">All services <small>the worst of each</small></h2>
+    <div class="kpis">${tiles.join('')}
+    </div>
+  </section>`;
+}
+
+// The table twin of the daily chart and the burndown, newest day first. A scroll box,
+// not a <details>: the 60 s reload would close a <details> while someone reads it.
 function table(v) {
   const id = `${esc(v.t.id)}-dn`;
   const rows = v.cal.map(({ day, d }, i) => `<tr><td>${esc(day)}</td>${d
@@ -469,25 +567,26 @@ function table(v) {
     </div>`;
 }
 
-const BURN = { good: 'Within the pace the SLO allows', warn: 'Faster than the SLO allows',
-  bad: 'Over 10x the pace the SLO allows', none: 'Too few checks for a rate' };
-
-// A service: at a glance first (state, one sentence, three numbers, the 30-day strip),
-// then the SRE detail, rendered open when the URL says ?open=<id>. The selection lives
-// in the query, which the meta refresh carries (see renderPage): a <details> closes on
-// every reload, and a #fragment cannot survive one (Chromium drops a fragment added by
-// a click, and a refresh to a URL with one never reloads). Each toggle is a page load;
-// the #fragment on the Show link only scrolls to the panel on that first load.
-function panel(v, now, open) {
+// A service: its state and one sentence, then three panels (up time, the downtime
+// allowance and response time), each a figure over its chart, then the SRE detail,
+// rendered open when the URL says ?open=<id>. The selection lives in the query, which
+// the meta refresh carries (see renderPage): a <details> closes on every reload, and a
+// #fragment cannot survive one (Chromium drops a fragment added by a click, and a
+// refresh to a URL with one never reloads). Each toggle is a page load; the #fragment
+// on the Show link only scrolls to the service on that first load.
+function service(v, now, open) {
   const { t, last } = v;
   const id = esc(t.id);
   const when = last && `<time datetime="${esc(new Date(last.ts).toISOString())}" title="${esc(stamp(last.ts))}">${esc(ago(now - last.ts))}</time>`;
+  const toggles = last ? `
+    <a class="toggle show" href="?open=${id}#${id}" aria-label="Show details for ${esc(t.name)}">Show details</a>
+    <a class="toggle hide" href="/#${id}-top" aria-label="Hide details for ${esc(t.name)}">Hide details</a>` : '';
   const head = `
-  <header class="phead" id="${id}-top">
+  <header class="shead" id="${id}-top">
     <span class="pill ${v.tone}">${icon(v.tone)}${v.label}</span>
     <h2>${esc(t.name)}</h2>
-    <a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a>${last ? `
-    <p class="when">Checked ${when}</p>` : ''}
+    <a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a>
+    <p class="when">${last ? `Checked ${when} &middot; ` : ''}${esc(EVERY[t.cron] ?? t.cron)}</p>${toggles}
   </header>`;
 
   if (!last) {
@@ -497,7 +596,7 @@ function panel(v, now, open) {
     const wait = Math.max(1, Math.round((Math.ceil(now / every) * every - now) / 60_000));
     const next = t.source ? 'after the next GitHub Actions run' : `in about ${wait} min`;
     return `
-<section class="panel none" id="${id}">${head}
+<section class="svc none" id="${id}">${head}
   <div class="empty">
     <p><b>No checks yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive ${esc(next)}.</p>
     <p>It will be held to ${esc(target(t.slo))} availability, with ${esc(target(t.latencySlo))} of good checks answering within ${esc(dur(t.threshold))}.</p>
@@ -513,48 +612,46 @@ function panel(v, now, open) {
     down: [last.status === null ? 'No answer' : `HTTP ${last.status}`, 'bad', 'The last check failed'],
     stale: [last.ok ? dur(last.ms) : 'Failed', 'none', 'Out of date'],
   }[v.state];
-  const h = history(v);
+  const h = availChart(v);
   const b24 = toneOf(v.burn24);
   const b1 = toneOf(v.burn1);
+  const latTone = v.lat === null ? 'none' : v.lat >= t.latencySlo ? 'good' : 'bad';
   const result = last.status === null ? esc(last.err) : `HTTP ${esc(last.status)} in ${esc(dur(last.ms))}`;
   const goal = (x, g, what) => (x === null ? note('none', 'No data yet')
     : note(x >= g ? 'good' : 'bad', `${x >= g ? 'Meets' : 'Below'} the ${target(g)} ${what}`));
 
   return `
-<section class="panel ${v.tone}${open ? ' open' : ''}" id="${id}">${head}
+<section class="svc ${v.tone}${open ? ' open' : ''}" id="${id}">${head}
   <p class="lead">${esc(sentence(v, now))}</p>
-  <div class="figs">${fig(availTone, 'Up time, 30 days', 'availability',
-    esc(v.avail === null ? 'No data' : pct(v.avail)), goal(v.avail, t.slo, 'goal'))}${fig(nowTone, 'Response time', 'newest check',
-    esc(nowValue), note(nowTone, nowNote))}${fig(`${b.tone} wide`, 'Downtime allowance left', 'error budget',
-    b.value, `<div class="meter" aria-hidden="true">${b.bar}</div>${note(b.tone, b.text)}`)}
-  </div>${h.strip}
-  <div class="foot">
-    <p class="daysum">${h.key}</p>
-    <a class="toggle show" href="?open=${id}#${id}" aria-label="Show details for ${esc(t.name)}">Show details</a>
-    <a class="toggle hide" href="/#${id}-top" aria-label="Hide details for ${esc(t.name)}">Hide details</a>
+  <div class="panels">${pnl('av', 'Up time', 'availability', '30 d',
+    esc(v.avail === null ? 'No data' : pct(v.avail)), goal(v.avail, t.slo, 'goal'),
+    sub('Checks', esc(int(v.checks))) + sub('Failed', esc(int(v.failed))),
+    `A check is up when the site answers with a 2xx status within ${esc(dur(t.timeout))}.`, h.chart)}${pnl('bd opt', 'Downtime allowance', 'error budget', '30 d',
+    b.value, `<div class="meter ${b.tone}" aria-hidden="true">${b.bar}</div>${note(b.tone, b.text)}`,
+    sub('Spending rate, 24 h', esc(v.burn24 === null ? 'No data' : rate(v.burn24)), b24, BURN[b24])
+      + sub('Spending rate, 1 h', esc(v.burn1 === null ? 'No data' : rate(v.burn1)), b1, BURN[b1]),
+    'Burn rate. 1.0x = on pace to use the whole allowance in exactly 30 days; 10x would use it in 3.', burndownChart(v))}${pnl('lt opt', 'Response time', 'newest check', '24 h',
+    esc(nowValue), note(nowTone, nowNote),
+    sub('95% answered within', esc(v.p95 === null ? 'No data' : dur(v.p95)))
+      + sub(`Under ${dur(t.threshold)}, 30 d`, esc(v.lat === null ? 'No data' : pct(v.lat)), latTone,
+        `${latTone === 'none' ? 'No data' : latTone === 'good' ? 'Meets' : 'Below'} the ${target(t.latencySlo)} latency target`),
+    `p95, 24 h: 95% of answered checks were this fast or faster. Latency SLI, 30 d: the share of answered checks under ${esc(dur(t.threshold))}.`, latencyChart(v, now))}
   </div>
   <div class="more">
-    <dl class="minor">${row('Spending rate, 24 h', 'burn rate', esc(v.burn24 === null ? 'No data' : rate(v.burn24)),
-      note(b24, BURN[b24]))}${row('Spending rate, 1 h', 'burn rate', esc(v.burn1 === null ? 'No data' : rate(v.burn1)),
-      note(b1, BURN[b1]))}${row('95% answered within', 'p95, 24 h', esc(v.p95 === null ? 'No data' : dur(v.p95)),
-      '<p class="s">Answered checks only</p>')}${row(`Answers under ${dur(t.threshold)}, 30 days`, 'latency SLI',
-      esc(v.lat === null ? 'No data' : pct(v.lat)), goal(v.lat, t.latencySlo, 'target'))}${row('Last check', '', result,
-      `<p class="s">${esc(stamp(last.ts))}</p>`)}${row('Checked', '', esc(EVERY[t.cron] ?? t.cron),
+    <dl class="minor">${row('Last check', '', result, `<p class="s">${esc(stamp(last.ts))}</p>`)}${row('Checked', '', esc(EVERY[t.cron] ?? t.cron),
       `<p class="s">From ${t.source ? 'GitHub Actions' : 'Cloudflare'}</p>`)}${row('Days with data', '',
       esc(`${v.cal.filter(({ d }) => d).length} of ${WINDOW_DAYS}`),
       h.worst ? `<p class="s">${esc(`Worst: ${h.worst.day}, ${pct(h.worst.a)} up`)}</p>` : '')}
-    </dl>
-    <p class="hint">Spending rate: 1.0x = on pace to use the whole allowance in exactly 30 days. 10x would use it in 3.</p>
-    <div class="charts">${burndownChart(v)}${latencyChart(v, now)}
-    </div>${v.left === null ? '' : table(v)}
+    </dl>${v.left === null ? '' : table(v)}
   </div>
 </section>`;
 }
 
 // Favicon dot in the overall tone. Hex is spelled out: a data: URI cannot read CSS variables.
-const DOT = { good: '2e8b57', warn: 'b8800f', bad: 'b3301f', none: '8a8273' };
+const DOT = { good: '249c74', warn: 'b6770b', bad: '9a2b19', none: '8a8273' };
 const favicon = (tone) => "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
   + `%3Ccircle cx='8' cy='8' r='7' fill='%23${DOT[tone]}'/%3E%3C/svg%3E`;
+const CAL = '<svg class="ic" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3"/></svg>';
 
 // open: the ?open= value. Only a known id gets through, so nothing else reaches the page.
 function renderPage(stats, now, open = null) {
@@ -578,41 +675,49 @@ function renderPage(stats, now, open = null) {
 <title>${esc(head)} | Uptime and SLOs</title>
 <link rel="icon" href="${favicon(tone)}">
 <style>
-  /* Paper and ink from theoith.ink, so this reads as part of the same site. */
+  /* Paper and ink from theoith.ink, stepped toward neutral so the status colours stand
+     out, with the site's monospace for machine strings (hosts, dates, UTC times). */
   :root {
-    --bg: #f2ead9; --card: #fffcf4; --text: #1c1a17; --muted: #5a5347; --line: #e2d8c3; --track: #ece3d0;
-    --link: #2b6b78; --axis: #b5a88e;
-    /* Warn is a step darker than the site's amber, so a warn mark clears 3:1 on a card. */
-    --good: #2e8b57; --good-ink: #236b43; --warn: #b8800f; --warn-ink: #855600;
-    --bad: #b3301f; --bad-ink: #9e2a1b; --none: #d8cdb6; --none-ink: #5a5347;
-    /* Data lines are ink. The link teal sits too close to the status green to share a chart. */
-    --series: var(--text);
+    --sans: system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --gut: 44px; /* the y-label lane of every chart */
+    --bg: #f3f1ec; --card: #fdfcfa; --raised: #f6f4ef; --line: #e2ddd3; --grid: #ece8e0; --axis: #b5ad9e;
+    --text: #1c1a17; --muted: #5e584e;
+    /* One accent, on data and focus only. The accent and the three status hues were
+       checked as one set: every pair apart under protan and deutan simulation and to
+       normal vision, each mark 3:1 on a panel (--none too: it marks a day with no data).
+       Each -ink is the 4.5:1 text shade. */
+    --accent: #2672b7;
+    --good: #249c74; --good-ink: #17704f; --warn: #b6770b; --warn-ink: #845300;
+    --bad: #9a2b19; --bad-ink: #9a2b19; --none: #8a8376; --none-ink: #5e584e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #15130f; --card: #1f1c17; --text: #f2ead9; --muted: #b3a994; --line: #35302a; --track: #2e2a23;
-      --link: #7cc0cd; --axis: #5a5347;
-      --good: #4caf7d; --good-ink: #86d4a6; --warn: #d9a441; --warn-ink: #f0c46e;
-      --bad: #e06a55; --bad-ink: #f39a88; --none: #3d382f; --none-ink: #b3a994;
+      --bg: #0e0d0b; --card: #171613; --raised: #1f1d1a; --line: #2a2824; --grid: #23211d; --axis: #4d4840;
+      --text: #f2ead9; --muted: #a8a193; --accent: #4a8fd8;
+      --good: #36a980; --good-ink: #6dcfa6; --warn: #bb881a; --warn-ink: #e3b15a;
+      --bad: #c1351e; --bad-ink: #f08a74; --none: #716b62; --none-ink: #a8a193;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); overflow-wrap: break-word;
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .wrap { max-width: 1160px; margin: 0 auto; padding: 0 16px 40px; }
+    font: 14px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 0 32px 48px; }
   p { margin: 0; }
-  a { color: var(--link); text-underline-offset: 2px; }
-  /* Teal, not red: red already means down on this page. */
-  a:focus-visible, .scroll:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 4px; }
+  a { color: inherit; text-underline-offset: 3px; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); }
+  a:hover { text-decoration-color: currentColor; }
+  a:focus-visible, .scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
   /* The technical term next to a plain label: there for an SRE, quiet for everyone else. */
-  small { font-size: .8em; font-weight: 400; color: var(--muted); white-space: nowrap; }
-  h1 { font-size: 1.75rem; line-height: 1.2; letter-spacing: -.01em; margin: 12px 0 4px; }
-  h2 { font-size: 1.3rem; line-height: 1.3; margin: 0; }
-  h3 { font-size: .95rem; line-height: 1.3; margin: 0; }
-  .sub, .host, .when, dt, .ends, .daysum, .hint, .meta, figcaption p, footer, .nodata { color: var(--muted); }
-  .sub { margin-bottom: 16px; }
+  small { font-size: .85em; font-weight: 400; color: var(--muted); white-space: nowrap; }
+  h1, h2, h3 { margin: 0; line-height: 1.25; }
+  h1 { font-size: 24px; font-weight: 650; letter-spacing: -.015em; }
+  h2 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
+  h3 { font-size: 13px; font-weight: 600; }
+  .sub-t, .crumb, .when, .host, dt, .ends, .daysum, .hint, .meta, figcaption, footer, .nodata, .yax, .win { color: var(--muted); }
+  .host, .win, .meta time, .ends, .yax, td:first-child { font-family: var(--mono); font-size: 12px; }
+  .v, .sub dd, .yax, table, .when { font-variant-numeric: tabular-nums; }
 
-  /* One tone per state. --c is the swatch, --ci the text shade, --on the glyph inside an icon. */
+  /* One tone per state. --c is the mark, --ci the text shade, --on the glyph inside an icon. */
   .good { --c: var(--good); --ci: var(--good-ink); --on: var(--card); }
   .warn { --c: var(--warn); --ci: var(--warn-ink); --on: #1c1a17; }
   .bad { --c: var(--bad); --ci: var(--bad-ink); --on: var(--card); }
@@ -621,147 +726,189 @@ function renderPage(stats, now, open = null) {
   .icon .f { fill: var(--c); }
   .icon .g { fill: none; stroke: var(--on); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .icon .d { fill: none; stroke: var(--ci); stroke-width: 1.6; stroke-dasharray: 2.6 2.1; }
+  .ic { width: 14px; height: 14px; fill: none; stroke: var(--muted); stroke-width: 1.4; stroke-linecap: round; }
 
-  /* The header says the page is live and when it will reload. The dot is the
-     text shade of the overall tone, so it clears 3:1 on the page in every state. */
-  .top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px;
-    padding: 20px 0 4px; font-size: .9rem; }
-  .top > a { font-weight: 600; text-decoration: none; }
-  .top > a:hover { text-decoration: underline; }
-  .live { position: relative; display: flex; align-items: center; gap: 8px; padding-bottom: 6px; font-size: .85rem; color: var(--muted); }
-  .live b { color: var(--text); font-weight: 650; }
+  /* 1. The header bar: title, the window, live, then the whole page in words. */
+  .bar { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px 24px; padding: 24px 0 16px; }
+  .crumb { display: flex; gap: 6px; font-size: 13px; margin-bottom: 4px; }
+  .crumb a { color: var(--text); font-weight: 600; text-decoration: none; }
+  .crumb a:hover { text-decoration: underline; }
+  .sub-t { margin-top: 2px; font-size: 13px; }
+  .ctl { display: flex; flex-wrap: wrap; gap: 8px; }
+  /* Readouts in the shape of controls, the way an ops dashboard shows its scope. */
+  .chip { position: relative; display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--card); font-size: 13px; white-space: nowrap; overflow: hidden; }
+  .live { color: var(--muted); }
+  .live b { color: var(--text); font-weight: 600; }
+  /* The dot is the text shade of the overall tone, so it clears 3:1 in every state. */
   .live i { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--ci); }
   /* Drains over the 60 s until the meta refresh. Shown only with motion on. */
-  .tick { display: none; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; border-radius: 2px;
-    overflow: hidden; background: var(--line); }
+  .tick { display: none; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--line); }
   .tick::before { content: ""; display: block; height: 100%; background: var(--muted); transform-origin: left; }
+  .banner { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 12px 16px; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--c) 40%, var(--line)); background: color-mix(in srgb, var(--c) 9%, var(--card)); }
+  .banner h2 { display: flex; align-items: center; gap: 8px; font-size: 16px; }
+  .banner .meta { margin-left: auto; font-size: 13px; }
 
-  /* 1. The whole page in words. */
-  .banner { display: grid; gap: 4px; padding: 16px 20px; margin-bottom: 20px; border-radius: 12px;
-    border: 1px solid color-mix(in srgb, var(--c) 45%, var(--line));
-    background: color-mix(in srgb, var(--c) 12%, var(--card)); }
-  .banner h2 { display: flex; align-items: center; gap: 10px; font-size: 1.45rem; }
-  .meta { font-size: .85rem; }
+  /* 2. Rows of panels. One gutter (16 px), one radius (8 px), hairline edges. */
+  .row { margin-top: 28px; }
+  .rowh { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+  .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+  .kpi, .pnl { min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .kpi { display: grid; align-content: start; gap: 6px; }
+  .vrow { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 4px 12px; }
+  .v { font-size: 28px; font-weight: 600; line-height: 1.15; letter-spacing: -.02em; }
+  .v small { font-size: 14px; font-weight: 500; letter-spacing: 0; }
+  /* A value that is words, not a number ("No answer"), is set smaller in the same line height. */
+  .v.word { font-size: 20px; line-height: 1.6; letter-spacing: -.01em; }
+  .who { font-size: 13px; font-weight: 600; }
+  .fl { list-style: none; margin: 2px 0 0; padding: 0; display: grid; gap: 2px; font-size: 13px; }
+  .fl li { display: flex; justify-content: space-between; gap: 8px; }
+  .fl a { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+  .fl a:hover { text-decoration: underline; }
+  .fl span { color: var(--muted); }
+  .spark { width: 96px; height: 34px; overflow: visible; }
+  .spark path { fill: none; vector-effect: non-scaling-stroke; }
+  .spark .sl { stroke: var(--muted); stroke-width: 1.5; stroke-linejoin: round; }
+  .spark .dot { stroke: var(--accent); stroke-width: 7; stroke-linecap: round; }
+  .spark .ring { stroke: var(--card); stroke-width: 11; stroke-linecap: round; }
 
-  /* 2. One panel per service: state and a sentence, three big numbers, the strip.
-     Only trouble gets a coloured edge. */
-  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 24px;
-    margin-bottom: 16px; scroll-margin-top: 12px; }
-  .panel.warn, .panel.bad { border-color: var(--c); border-top-width: 4px; }
-  .phead { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; scroll-margin-top: 12px; }
-  .phead .when { margin-left: auto; font-size: .85rem; }
-  .host { font-size: .9rem; }
-  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; white-space: nowrap;
-    font-size: .85rem; font-weight: 650; color: var(--ci); background: color-mix(in srgb, var(--c) 16%, var(--card));
-    border: 1px solid color-mix(in srgb, var(--c) 45%, transparent); }
-  .lead { margin-top: 10px; font-size: 1.05rem; max-width: 64ch; }
-
-  .figs { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 16px 32px; margin-top: 18px; }
-  .fig { display: grid; align-content: start; gap: 4px; min-width: 0; }
-  .k { font-size: .85rem; color: var(--muted); }
-  .fig .v { font-size: 2.1rem; font-weight: 650; line-height: 1.1; letter-spacing: -.02em; }
-  .fig .v small { font-size: .45em; letter-spacing: 0; font-weight: 500; }
-  .fig .v.word { font-size: 1.5rem; line-height: 1.55; letter-spacing: -.01em; }
-  .s { display: flex; align-items: flex-start; gap: 6px; font-size: .8rem; line-height: 1.35; color: var(--muted); }
-  .s .icon { margin-top: .15em; }
+  .s { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; line-height: 1.35; color: var(--muted); }
+  .s .icon { margin-top: .1em; }
   .s.good, .s.warn, .s.bad { color: var(--ci); font-weight: 600; }
+
+  /* 3. A service: state, one sentence, three panels. */
+  .svc { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--line); scroll-margin-top: 12px; }
+  .shead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; scroll-margin-top: 12px; }
+  .when { margin-left: auto; font-size: 13px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px; white-space: nowrap;
+    font-size: 13px; font-weight: 650; color: var(--ci); background: color-mix(in srgb, var(--c) 14%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--c) 45%, transparent); }
+  .lead { margin: 10px 0 16px; font-size: 16px; max-width: 75ch; }
+  .panels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  /* Each panel spans three rows of the panel grid (figure, smaller figures, chart),
+     so the smaller figures and the charts start on one line across a row. */
+  .pnl { display: grid; grid-row: span 3; grid-template-rows: subgrid; }
+  .top { display: grid; align-content: start; gap: 4px; }
+  .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .top .v { margin-top: 4px; }
+  .sub { display: grid; align-content: start; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .sub dl { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0; }
+  .sub dt, .minor dt { font-size: 12px; }
+  .sub dd { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; font-size: 16px; }
+  .sub dd b { font-weight: 600; }
+  .hint { font-size: 12px; }
   /* The track is a pale step of the fill's own tone, so the state reads across the whole bar. */
-  .meter { height: 8px; margin: 6px 0 2px; border-radius: 999px; overflow: hidden;
-    background: color-mix(in srgb, var(--c) 20%, var(--track)); }
+  .meter { height: 8px; margin: 6px 0 4px; border-radius: 999px; overflow: hidden;
+    background: color-mix(in srgb, var(--c) 18%, var(--raised)); }
   .meter span { display: block; height: 100%; border-radius: 999px; background: var(--c); }
   /* Overspent: a full bar, striped, so it does not read as a full budget. */
   .meter .over { width: 100%; background: repeating-linear-gradient(135deg, var(--bad) 0 6px, transparent 6px 10px); }
 
-  .days { margin-top: 20px; }
-  .strip { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); align-items: end; gap: 3px; height: 32px; margin-top: 8px; }
-  .strip span { height: 100%; border-radius: 2px; background: var(--c); }
-  .strip .warn { height: 70%; }
-  .strip .bad { height: 45%; }
-  .strip span:hover { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--text); }
-  /* No data is hollow and dashed, like the no-data icon, so it is not a colour to learn. */
-  .strip .none, .sw.none { background: transparent; border: 1.5px dashed color-mix(in srgb, var(--muted) 60%, transparent); }
-  .ends { display: flex; justify-content: space-between; font-size: .75rem; margin-top: 4px; }
-  .foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-top: 10px; }
-  .daysum { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: .8rem; }
-  .key { white-space: nowrap; }
-  .sw { display: inline-block; width: 9px; height: 13px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; background: var(--c); }
-
-  /* 3. The SRE detail, one service at a time, open when the server marks its panel .open. */
-  .toggle { display: inline-flex; align-items: center; gap: 8px; padding: 5px 14px; border-radius: 999px;
-    border: 1px solid var(--line); font-size: .85rem; font-weight: 600; text-decoration: none; }
-  .toggle::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 2px 2px 0;
-    transform: translateY(-2px) rotate(45deg); }
-  .toggle.hide::after { transform: translateY(2px) rotate(-135deg); }
-  .toggle:hover { background: color-mix(in srgb, var(--link) 10%, var(--card)); border-color: color-mix(in srgb, var(--link) 45%, var(--line)); }
-  .more, .hide { display: none; }
-  .open .show { display: none; }
-  .open .hide { display: inline-flex; }
-  /* minmax(0, 1fr): an auto column would grow to the detail grid's min-content and overflow a phone. */
-  .open .more { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
-
-  .minor { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr)); gap: 14px 24px; margin: 0; }
-  dt { font-size: .8rem; }
-  dd { display: grid; gap: 2px; margin: 2px 0 0; }
-  dd b { font-size: 1.05rem; font-weight: 650; overflow-wrap: anywhere; }
-  .hint { font-size: .8rem; }
-
-  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-  .chart { margin: 0; min-width: 0; padding: 14px 16px 12px; border: 1px solid var(--line); border-radius: 10px; }
-  figcaption p { font-size: .8rem; }
-  .plot { position: relative; height: 160px; margin-top: 12px; }
-  .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-  .plot path { fill: none; vector-effect: non-scaling-stroke; }
-  .grid { stroke: var(--line); stroke-width: 1; }
+  .chart { margin: 0; min-width: 0; display: grid; align-content: start; gap: 6px; }
+  /* Two lines held for every caption, so the plots of a row start on one line. */
+  figcaption { font-size: 12px; min-height: calc(2 * 1.45em); }
+  .plot { position: relative; height: 128px; margin: 8px 0 2px; }
+  .yax span { position: absolute; left: 0; width: calc(var(--gut) - 8px); text-align: right; transform: translateY(-50%); line-height: 1; }
+  .area { position: absolute; inset: 0 0 0 var(--gut); }
+  .area svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .area path { fill: none; vector-effect: non-scaling-stroke; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
   .axis { stroke: var(--axis); stroke-width: 1; }
-  /* Dashed only for the two reference lines, never for grid or axes. */
+  /* Dashed only for reference lines (goal, pace), never for grid or axes. */
   .pace, .thr { stroke: var(--muted); stroke-width: 1.25; stroke-dasharray: 4 4; }
-  .ln { stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .ln { stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .ln.warn, .dot.warn { stroke: var(--warn); }
   .ln.bad, .dot.bad, .fail { stroke: var(--bad); }
-  .plot .wash { fill: var(--series); fill-opacity: .07; }
-  .plot .wash.bad { fill: var(--bad); fill-opacity: .16; }
+  .area .wash { fill: var(--accent); fill-opacity: .1; }
+  .area .wash.bad { fill: var(--bad); fill-opacity: .16; }
+  .area .band { fill: var(--warn); fill-opacity: .08; }
   .ring { stroke: var(--card); stroke-width: 12; stroke-linecap: round; }
-  .dot { stroke: var(--series); stroke-width: 8; stroke-linecap: round; }
+  .dot { stroke: var(--accent); stroke-width: 8; stroke-linecap: round; }
   .fail { stroke-width: 2; }
   .hit { fill: transparent; }
   .hit:hover { fill: color-mix(in srgb, var(--text) 8%, transparent); }
-  .lbl { position: absolute; left: 0; transform: translateY(-100%); padding: 0 4px 2px 0; font-size: .75rem; line-height: 1.2;
-    color: var(--muted); white-space: nowrap; background: color-mix(in srgb, var(--card) 85%, transparent); pointer-events: none; }
-  .lbl.end { left: auto; right: 0; padding: 0 0 2px 4px; transform: translateY(calc(-100% - 8px)); color: var(--text); font-weight: 650; }
-  .lbl.end.below { transform: translateY(8px); }
-  .lbl.end.bad { color: var(--bad-ink); }
-  .nodata { font-size: .9rem; padding: 40px 0; text-align: center; }
+  .lbl { position: absolute; right: 0; padding: 0 0 2px 4px; transform: translateY(calc(-100% - 8px)); font-size: 12px; line-height: 1.2;
+    font-weight: 650; white-space: nowrap; background: color-mix(in srgb, var(--card) 85%, transparent); pointer-events: none; }
+  .lbl.below { transform: translateY(8px); }
+  .lbl.bad { color: var(--bad-ink); }
+  .ends { display: flex; justify-content: space-between; margin-left: var(--gut); }
+  .nodata { font-size: 13px; padding: 48px 0; text-align: center; border: 1px dashed var(--line); border-radius: 6px; }
 
-  .raw { font-size: .85rem; }
-  .scroll { max-height: 15rem; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; }
-  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 4px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  /* The daily bars: the goal is a dashed line drawn over them, so a short day shows
+     how far it fell, and the baseline is the one solid rule. */
+  .bars { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); align-items: end; gap: 2px; border-bottom: 1px solid var(--axis); }
+  .bars span { min-height: 3px; border-radius: 2px 2px 0 0; background: var(--c); }
+  .bars span:hover { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--text); }
+  /* No data is hollow and dashed, like the no-data icon, so it is not a colour to learn. */
+  .bars .none, .sw.none { background: transparent; border: 1px dashed var(--none); }
+  .bars .none { height: 100%; border-bottom: 0; }
+  .goal { position: absolute; left: var(--gut); right: 0; border-top: 1.5px dashed var(--text); opacity: .75; pointer-events: none; }
+  .daysum { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 4px; font-size: 12px; }
+  .key { white-space: nowrap; }
+  .sw { display: inline-block; width: 9px; height: 12px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; background: var(--c); }
+
+  /* 4. The SRE detail, one service at a time, open when the server marks it .open. */
+  .toggle { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--card); font-size: 13px; font-weight: 600; text-decoration: none; }
+  .toggle::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.5px 1.5px 0;
+    transform: translateY(-2px) rotate(45deg); }
+  .toggle.hide::after { transform: translateY(2px) rotate(-135deg); }
+  .toggle:hover { background: var(--raised); border-color: var(--axis); }
+  .more, .hide { display: none; }
+  .open .show { display: none; }
+  .open .hide { display: inline-flex; }
+  .open .more { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 16px; margin-top: 16px; align-items: start; }
+  .minor { display: grid; gap: 14px; margin: 0; padding: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+  dd { display: grid; gap: 2px; margin: 2px 0 0; }
+  .minor dd b { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .raw h3 { margin-bottom: 8px; }
+  .scroll { max-height: 16rem; overflow: auto; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 6px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
-  th { position: sticky; top: 0; font-weight: 600; font-size: .78rem; color: var(--muted); background: var(--card); }
+  th { position: sticky; top: 0; font-weight: 600; font-size: 12px; color: var(--muted); background: var(--card); }
 
-  .empty { display: grid; gap: 6px; margin-top: 14px; padding: 14px 16px; border-radius: 8px; font-size: .9rem;
-    color: var(--muted); border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent); }
+  .empty { display: grid; gap: 6px; margin-top: 16px; padding: 16px; border-radius: 8px; font-size: 14px;
+    color: var(--muted); border: 1px dashed var(--axis); }
   .empty b { color: var(--text); }
 
-  /* 4. How it is measured, at the bottom, opened the same way as a service's detail. */
-  footer { display: grid; justify-items: start; gap: 12px; font-size: .85rem; border-top: 1px solid var(--line);
-    margin-top: 24px; padding-top: 16px; scroll-margin-top: 12px; }
-  footer.open .more { gap: 8px; }
+  /* 5. How it is measured, at the bottom, opened the same way as a service's detail. */
+  footer { display: grid; justify-items: start; gap: 12px; font-size: 13px; border-top: 1px solid var(--line);
+    margin-top: 40px; padding-top: 20px; scroll-margin-top: 12px; }
+  footer.open .more { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 0; max-width: 80ch; }
   footer ul { margin: 0; padding-left: 20px; }
+  footer .back { font-weight: 600; }
 
+  @media (max-width: 1099px) {
+    .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .pnl.lt { grid-column: 1 / -1; }
+  }
   @media (max-width: 760px) {
-    .charts { grid-template-columns: minmax(0, 1fr); }
+    .wrap { padding: 0 16px 32px; }
+    .panels { grid-template-columns: minmax(0, 1fr); }
+    /* One column: no row to line up with, so each panel is a plain stack. */
+    .pnl { display: grid; grid-row: auto; grid-template-rows: none; gap: 14px; }
+    .open .more { grid-template-columns: minmax(0, 1fr); }
+    /* Progressive disclosure on a phone: the daily chart stays, the burndown and the
+       response-time chart come with the details. */
+    .svc:not(.open) .opt .chart { display: none; }
   }
   @media (max-width: 560px) {
-    h1 { font-size: 1.5rem; }
-    .banner h2 { font-size: 1.25rem; }
-    .panel { padding: 16px; }
-    .phead .when { margin-left: 0; flex-basis: 100%; }
-    .figs { grid-template-columns: 1fr 1fr; gap: 16px; }
-    .fig.wide { grid-column: 1 / -1; }
-    .fig .v { font-size: 1.75rem; }
-    .chart { padding: 12px; }
-    .strip { gap: 2px; height: 28px; }
+    h1 { font-size: 22px; }
+    h2 { font-size: 18px; }
+    .bar { padding-top: 16px; }
+    .kpis { gap: 12px; }
+    .kpi { padding: 12px; }
+    .v { font-size: 24px; }
+    .v.word { font-size: 18px; }
+    .spark { width: 100%; height: 28px; }
+    .when { margin-left: 0; flex-basis: 100%; }
+    .banner .meta { margin-left: 0; }
+    .toggle { height: 40px; } /* a thumb-sized target */
+    .pnl { padding: 14px; }
+    .bars { gap: 1px; }
   }
 
   /* Motion, only for people who have not asked for less. Every entrance animates
@@ -777,20 +924,21 @@ function renderPage(stats, now, open = null) {
        stays clear of WCAG 2.2.2, which asks for a pause control on longer motion. */
     .live.good i::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: inherit;
       animation: ping 1.5s ease-out 3 both; }
-    .fig .v { animation: rise-in .45s ease-out backwards; }
-    .fig + .fig .v { animation-delay: 60ms; }
-    .fig + .fig + .fig .v { animation-delay: 120ms; }
+    .v { animation: rise-in .45s ease-out backwards; }
+    .kpi + .kpi .v, .pnl + .pnl .v { animation-delay: 60ms; }
+    .kpi + .kpi + .kpi .v, .pnl + .pnl + .pnl .v { animation-delay: 120ms; }
+    .kpi + .kpi + .kpi + .kpi .v { animation-delay: 180ms; }
     .meter span { transform-origin: left; animation: grow .8s cubic-bezier(.2, .8, .2, 1) .15s backwards; }
     /* Oldest day first, so the wave ends on today. sibling-index() is newer than the
        rest; where it is missing, every bar rises at once. */
-    .strip span { transform-origin: bottom; animation: lift .4s cubic-bezier(.2, .8, .2, 1) backwards;
+    .bars span { transform-origin: bottom; animation: lift .4s cubic-bezier(.2, .8, .2, 1) backwards;
       animation-delay: calc(sibling-index() * 10ms); transition: transform .15s ease-out; }
-    .strip span:hover { transform: scaleY(1.12); }
+    .bars span:hover { transform: scaleY(1.06); }
     .open .more { animation: rise-in .3s ease-out backwards; }
     /* A wipe, not stroke-dashoffset: non-scaling-stroke measures dashes on screen,
        so a dash-based draw-in would end at a different length on every chart width. */
-    .plot svg { animation: wipe .8s cubic-bezier(.4, 0, .2, 1) .1s backwards; }
-    .plot .lbl { animation: fade .3s ease-out .6s backwards; }
+    .area svg, .spark { animation: wipe .8s cubic-bezier(.4, 0, .2, 1) .1s backwards; }
+    .area .lbl { animation: fade .3s ease-out .6s backwards; }
     .hit { transition: fill .15s; }
     .toggle { transition: background-color .15s, border-color .15s; }
   }
@@ -806,19 +954,25 @@ function renderPage(stats, now, open = null) {
 </head>
 <body>
 <div class="wrap">
-<header class="top">
-  <a href="https://theoith.ink/">&larr; theoith.ink</a>
-  <p class="live ${tone}"><i aria-hidden="true"></i><b>Live</b><span aria-hidden="true">&middot;</span><span>Refreshes every minute</span><span class="tick" aria-hidden="true"></span></p>
+<header class="bar">
+  <div>
+    <p class="crumb"><a href="https://theoith.ink/">theoith.ink</a><span aria-hidden="true">/</span><span>status</span></p>
+    <h1>Uptime and SLOs</h1>
+    <p class="sub-t">Whether my sites are up right now, and how reliable they have been over the last 30 days.</p>
+  </div>
+  <div class="ctl">
+    <p class="chip">${CAL}<span>Last 30 days</span></p>
+    <p class="chip live ${tone}"><i aria-hidden="true"></i><b>Live</b><span>Refreshes every minute</span><span class="tick" aria-hidden="true"></span></p>
+  </div>
 </header>
 <main>
-  <h1>Uptime and SLOs</h1>
-  <p class="sub">Whether my sites are up right now, and how reliable they have been over the last 30 days.</p>
   <section class="banner ${tone}" aria-labelledby="overall">
     <h2 id="overall">${icon(tone)}${esc(head)}</h2>
     ${notes.length ? `<p>${esc(notes.join(' '))}</p>` : ''}
-    <p class="meta">Updated <time datetime="${esc(new Date(now).toISOString())}">${esc(stamp(now))}</time>.</p>
+    <p class="meta">Updated <time datetime="${esc(new Date(now).toISOString())}">${esc(stamp(now))}</time></p>
   </section>
-  ${views.map((v) => panel(v, now, sel === v.t.id)).join('')}
+  ${summary(views)}
+  ${views.map((v) => service(v, now, sel === v.t.id)).join('')}
 </main>
 <footer id="how"${sel === 'how' ? ' class="open"' : ''}>
   <p id="how-top">The two Cloudflare-hosted sites are checked from Cloudflare, so this page shares fate with them:
@@ -843,6 +997,7 @@ function renderPage(stats, now, open = null) {
       onrender.com blocks requests from Cloudflare Workers, so a check from Cloudflare would measure that block, not Hulog.
       GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
   </div>
+  <p><a class="back" href="https://theoith.ink/">&larr; theoith.ink</a></p>
 </footer>
 </div>
 </body>
