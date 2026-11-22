@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
-  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown,
+  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown, failingSince,
 } from '../src/slo.js';
 
 const close = (actual, expected, eps = 1e-9) =>
@@ -92,4 +92,13 @@ test('alerts: a brand new target that fails twice goes DOWN', () => {
   assert.equal(alertFor([0]), null);
   assert.equal(alertFor([0, 0]), 'DOWN');
   assert.equal(alertFor([]), null);
+});
+
+test('outage start: first failure of the newest failed run', () => {
+  const p = (ts, ok) => ({ ts, ok });
+  assert.equal(failingSince([]), null);
+  assert.equal(failingSince([p(1, 0), p(2, 1)]), null); // newest is ok
+  assert.deepEqual(failingSince([p(1, 0), p(2, 1), p(3, 0), p(4, 0)]), { ts: 3, whole: false });
+  // Every probe failed: it started at or before the oldest one shown.
+  assert.deepEqual(failingSince([p(1, 0), p(2, 0)]), { ts: 1, whole: true });
 });

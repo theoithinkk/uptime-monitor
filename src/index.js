@@ -1,6 +1,6 @@
 import {
   FAILS_BEFORE_ALERT, sum, availability, latency,
-  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown,
+  budgetRemaining, budgetMinutes, percentile, alertFor, burnRate, burndown, failingSince,
 } from './slo.js';
 
 // What gets probed. Hardcoded on purpose: no request can make this Worker
@@ -164,25 +164,27 @@ async function loadStats(env, now) {
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const pct = (x, digits = 2) => `${(x * 100).toFixed(digits)}%`.replace('-', '−'); // a real minus sign
 const target = (x) => `${+(x * 100).toFixed(2)}%`; // 0.999 -> 99.9%
-const dur = (ms) => (ms < 10_000 ? `${ms} ms` : `${+(ms / 1000).toFixed(1)} s`);
+// Milliseconds under a second, seconds above, so 1840 ms reads 1.8 s next to a 1 s goal.
+const dur = (ms) => (ms < 1000 ? `${ms} ms` : `${+(ms / 1000).toFixed(1)} s`);
 const stamp = (ts) => `${new Date(ts).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 const rate = (x) => `${x.toFixed(x < 10 ? 1 : 0)}x`;
 const leftText = (v) => (v >= 0 ? `${pct(v, 1)} left` : `overspent by ${pct(-v, 1)}`);
 // Chart coordinates. Numbers only, escaped anyway so every value takes the same path.
 const num = (x) => esc((+x).toFixed(2));
 
-function ago(ms) {
+// A length of time in words, one unit, rounded: "45 minutes", "3 hours".
+function span(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 90) return `${s} s ago`;
-  if (s < 90 * 60) return `${Math.round(s / 60)} min ago`;
-  if (s < 36 * 3600) return `${Math.round(s / 3600)} h ago`;
-  return `${Math.round(s / 86400)} d ago`;
+  const [n, unit] = s < 90 ? [s, 'second'] : s < 90 * 60 ? [Math.round(s / 60), 'minute']
+    : s < 36 * 3600 ? [Math.round(s / 3600), 'hour'] : [Math.round(s / 86400), 'day'];
+  return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
+const ago = (ms) => `${span(ms)} ago`;
 
 // One rule colours a day in the strip and a recent burn rate: good while it spends
 // budget no faster than the SLO allows (burn rate up to 1), bad past 10 times that.
 const toneOf = (burn) => (burn === null ? 'none' : burn <= 1 ? 'good' : burn <= 10 ? 'warn' : 'bad');
-const LEVEL = { good: 'met the SLO', warn: 'missed', bad: 'missed badly', none: 'no data' };
+const LEVEL = { good: 'good', warn: 'missed the goal', bad: 'far below the goal', none: 'no data' };
 
 // The badge is the newest probe only. Slow: it answered, but over the latency threshold.
 // Stale: no probe for STALE_AFTER intervals, so the newest one no longer says
@@ -214,16 +216,16 @@ function overall(stats, now) {
   const notes = [];
   if (down.length) notes.push(`Down: ${down.join(', ')}.`);
   if (slow.length) notes.push(`Slow: ${slow.join(', ')}.`);
-  if (stale.length) notes.push(`Stale, no recent probe: ${stale.join(', ')}.`);
-  if (none.length && none.length < stats.length) notes.push(`Waiting for a first probe: ${none.join(', ')}.`);
-  if (none.length === stats.length) return { tone: 'none', head: 'Waiting for first probes', notes };
+  if (stale.length) notes.push(`Stale, no recent check: ${stale.join(', ')}.`);
+  if (none.length && none.length < stats.length) notes.push(`Waiting for a first check: ${none.join(', ')}.`);
+  if (none.length === stats.length) return { tone: 'none', head: 'Waiting for first checks', notes };
   if (down.length) return { tone: 'bad', head: count(down, 'down'), notes };
   if (slow.length) return { tone: 'warn', head: count(slow, 'slow'), notes };
   if (stale.length) return { tone: 'none', head: count(stale, 'stale'), notes };
-  return { tone: 'good', head: none.length ? 'All probed services operational' : 'All services operational', notes };
+  return { tone: 'good', head: none.length ? 'All checked services operational' : 'All services operational', notes };
 }
 
-// Everything the tile and the panel show for one service, worked out once.
+// Everything the panel shows for one service, worked out once.
 function derive(s, now) {
   const { t, days, recent } = s;
   const state = stateOf(s, now);
@@ -250,51 +252,72 @@ function derive(s, now) {
   };
 }
 
-// Error budget as a figure, a sentence and a meter. left: 1 untouched, 0 spent, below 0 overspent.
+// The downtime allowance (error budget) in minutes, or hours once it is that big.
+// Both numbers share the unit, so "33 of 43" compares at a glance.
+function allowance(t, left) {
+  const total = budgetMinutes(t.slo);
+  const [div, unit, u] = total >= 120 ? [60, 'hours', 'h'] : [1, 'minutes', 'min'];
+  const f = (m) => (m / div >= 10 ? Math.round(m / div) : +(m / div).toFixed(1));
+  return { n: f(Math.abs(left) * total), total: f(total), unit, u };
+}
+
+// The allowance as a figure, a meter and a note. left: 1 untouched, 0 spent, below 0 overspent.
+// value is HTML, so its parts are escaped here.
 function budget(t, left) {
-  if (left === null) return { tone: 'none', value: 'No data', text: 'No probes in the window yet', bar: '' };
-  const mins = budgetMinutes(t.slo);
+  if (left === null) return { tone: 'none', value: 'No data', bar: '', text: 'No checks in the window yet' };
+  const a = allowance(t, left);
   if (left < 0) {
-    return { tone: 'bad', value: pct(left, 1), bar: '<span class="over"></span>',
-      text: `Overspent by ${(-left * mins).toFixed(1)} min of a ${mins.toFixed(1)} min budget` };
+    return { tone: 'bad', value: `${esc(a.n)} <small>${esc(a.u)} over</small>`, bar: '<span class="over"></span>',
+      text: `Overspent by ${pct(-left, 1)}` };
   }
-  return { tone: left > 0.25 ? 'good' : left > 0 ? 'warn' : 'bad', value: pct(left, 1),
-    bar: `<span style="width:${num(left * 100)}%"></span>`,
-    text: left > 0 ? `${(left * mins).toFixed(1)} of ${mins.toFixed(1)} min left` : `Spent, all ${mins.toFixed(1)} min` };
+  return { tone: left > 0.25 ? 'good' : left > 0 ? 'warn' : 'bad',
+    value: `${esc(a.n)} <small>of ${esc(`${a.total} ${a.u}`)}</small>`,
+    bar: `<span style="width:${num(left * 100)}%"></span>`, text: `${pct(left, 1)} of the budget left` };
+}
+
+// The first thing a visitor reads about a service, built from the same numbers as
+// the figures below it, so the words and the numbers can never disagree.
+function sentence(v, now) {
+  const { t, last, left } = v;
+  const fail = failingSince(v.recent);
+  const head = {
+    up: left > 0.25 && v.avail >= t.slo ? 'Healthy.' : 'Up.',
+    slow: `Slow. The last check took ${dur(last.ms)}, over the ${dur(t.threshold)} goal.`,
+    // A down state always has a recent failure; the fallback is for clock skew.
+    down: fail ? `Down for ${fail.whole ? 'at least ' : ''}${span(now - fail.ts)}.` : 'Down.',
+    stale: `No check for ${span(now - last.ts)}, so its current state is unknown.`,
+  }[v.state];
+  if (left === null) return head;
+  const a = allowance(t, left);
+  return `${head} ${left > 0
+    ? `${pct(v.avail)} up over 30 days, ${a.n} of ${a.total} ${a.unit} of allowed downtime left.`
+    : `It has used ${left < 0 ? 'more than its whole' : 'all of its'} downtime allowance for the last 30 days.`}`;
 }
 
 const note = (tone, text) => `<p class="s ${tone}">${icon(tone)}<span>${esc(text)}</span></p>`;
-const kpi = (tone, label, value, extra) => `
-      <div class="kpi ${tone}"><p class="k">${esc(label)}</p><p class="v">${esc(value)}</p>${extra}</div>`;
-
-// Summary tile: state first, then the two numbers that say how bad.
-function tile(v) {
-  const figs = v.last
-    ? `<span><b>${esc(v.avail === null ? 'No data' : pct(v.avail))}</b> availability</span>
-      <span><b>${esc(budget(v.t, v.left).value)}</b> budget left</span>`
-    : '<span>No probes yet</span>';
-  return `
-  <li><a class="tile ${v.tone}" href="#${esc(v.t.id)}">
-    <span class="state">${icon(v.tone)}${v.label}</span>
-    <span class="name">${esc(v.t.name)}</span>
-    <span class="figs">${figs}</span>
-  </a></li>`;
-}
+// An at-a-glance number: plain label, the SRE term small, the value (HTML), a note.
+// A value that is words, not a number ("No answer"), is set smaller so it fits one line.
+const fig = (tone, label, term, value, extra) => `
+    <div class="fig ${tone}"><p class="k">${esc(label)} <small>${esc(term)}</small></p><p class="v${/^\d/.test(value) ? '' : ' word'}">${value}</p>${extra}</div>`;
+// A detail row for the SRE view. value is HTML.
+const row = (label, term, value, extra = '') => `
+      <div><dt>${esc(label)}${term ? ` <small>${esc(term)}</small>` : ''}</dt><dd><b>${value}</b>${extra}</dd></div>`;
 
 // Plots are drawn in a 100 x 100 box stretched to the container, so the same
 // numbers place the HTML labels as percentages. Strokes keep their width
 // (vector-effect in the CSS), and the labels are HTML so they never stretch.
-function figure(title, caption, body) {
+function figure(title, term, caption, body) {
   return `
     <figure class="chart">
-      <figcaption><h3>${title}</h3><p>${caption}</p></figcaption>${body}
+      <figcaption><h3>${title} <small>${term}</small></h3><p>${caption}</p></figcaption>${body}
     </figure>`;
 }
 
 function burndownChart(v) {
   const { t, cal, series } = v;
-  const caption = 'Budget left after each day of the window. Dashed: spending exactly on pace (1.0x).';
-  if (v.left === null) return figure('Error budget burndown', caption, '<p class="nodata">No probes in the window yet.</p>');
+  const head = ['Downtime allowance, 30 days', 'error budget burndown',
+    'What was left after each day. Dashed: using it exactly on pace (1.0x).'];
+  if (v.left === null) return figure(...head, '<p class="nodata">No checks in the window yet.</p>');
   const end = series[series.length - 1]; // the burndown only falls, so this is also the lowest point
   const lo = Math.min(0, end);
   const y = (val) => 14 + ((1 - val) / (1 - lo)) * 78; // room above 100% for its label, below 0 for air
@@ -306,9 +329,9 @@ function burndownChart(v) {
   const spent = cal[series.findIndex((val) => val <= 0)]?.day;
   const id = `${esc(t.id)}-bd`;
   const hits = cal.map(({ day, d }, i) => `<rect class="hit" x="${num((i * 100) / WINDOW_DAYS)}" y="0" width="${num(100 / WINDOW_DAYS)}" height="100">`
-    + `<title>${esc(`${day}: ${d ? `${d.total - d.good} failed of ${d.total} probes` : 'no data'}, budget ${leftText(series[i])}`)}</title></rect>`).join('');
+    + `<title>${esc(`${day}: ${d ? `${d.total - d.good} failed of ${d.total} checks` : 'no data'}, budget ${leftText(series[i])}`)}</title></rect>`).join('');
   const over = end < 0 ? ' bad' : '';
-  return figure('Error budget burndown', caption, `
+  return figure(...head, `
       <div class="plot">
         <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
           <title id="${id}-t">Error budget left over the last 30 days</title>
@@ -328,7 +351,7 @@ function burndownChart(v) {
           ${hits}
         </svg>
         <span class="lbl" style="top:${num(y(1))}%" aria-hidden="true">100%</span>
-        <span class="lbl" style="top:${num(z)}%" aria-hidden="true">0%, budget spent</span>
+        <span class="lbl" style="top:${num(z)}%" aria-hidden="true">0%, all used</span>
         <span class="lbl end${over}${y(end) < 30 ? ' below' : ''}" style="top:${yEnd}%" aria-hidden="true">${esc(leftText(end))}</span>
       </div>
       <div class="ends" aria-hidden="true"><span>${esc(cal[0].day)}</span><span>Today</span></div>`);
@@ -336,8 +359,9 @@ function burndownChart(v) {
 
 function latencyChart(v, now) {
   const { t, recent } = v;
-  const caption = `Time to response headers for each probe. Dashed: the ${esc(dur(t.threshold))} threshold. Red ticks: failed probes.`;
-  if (!recent.length) return figure('Response time, last 24 h', caption, '<p class="nodata">No probes in the last 24 hours.</p>');
+  const head = ['Response time, 24 hours', 'latency',
+    `Each check, to the first response. Dashed: the ${esc(dur(t.threshold))} goal. Red ticks: failed checks.`];
+  if (!recent.length) return figure(...head, '<p class="nodata">No checks in the last 24 hours.</p>');
   const start = now - DAY_MS;
   const good = recent.filter((r) => r.ok);
   const okMs = good.map((r) => r.ms);
@@ -364,7 +388,7 @@ function latencyChart(v, now) {
     const inHour = recent.filter((r) => r.ts >= from && r.ts < from + HOUR_MS);
     if (!inHour.length) return '';
     const ms = inHour.filter((r) => r.ok).map((r) => r.ms);
-    const parts = [`${inHour.length} probe${inHour.length === 1 ? '' : 's'}`];
+    const parts = [`${inHour.length} check${inHour.length === 1 ? '' : 's'}`];
     if (ms.length) parts.push(`median ${dur(percentile(ms, 50))}`, `slowest ${dur(Math.max(...ms))}`);
     if (ms.length < inHour.length) parts.push(`${inHour.length - ms.length} failed`);
     const x0 = x(from);
@@ -374,11 +398,11 @@ function latencyChart(v, now) {
   const slow = okMs.filter((ms) => ms > t.threshold).length;
   const failed = recent.length - good.length;
   const summary = okMs.length
-    ? `${recent.length} probes. Of the ${okMs.length} that answered: median ${dur(percentile(okMs, 50))}, p95 ${dur(v.p95)}, slowest ${dur(Math.max(...okMs))}, ${slow} over the ${dur(t.threshold)} threshold. ${failed} failed.`
-    : `${recent.length} probes, all failed.`;
+    ? `${recent.length} checks. Of the ${okMs.length} that answered: median ${dur(percentile(okMs, 50))}, p95 ${dur(v.p95)}, slowest ${dur(Math.max(...okMs))}, ${slow} over the ${dur(t.threshold)} goal. ${failed} failed.`
+    : `${recent.length} checks, all failed.`;
   // Each line is written twice, clipped above and below the threshold. A <use> would
   // save the bytes, but Chrome then stretches its stroke despite non-scaling-stroke.
-  return figure('Response time, last 24 h', caption, `
+  return figure(...head, `
       <div class="plot">
         <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-labelledby="${id}-t ${id}-d">
           <title id="${id}-t">Response time over the last 24 hours</title>
@@ -395,13 +419,14 @@ function latencyChart(v, now) {
           ${fails ? `<path class="fail" d="${fails}"/>` : ''}
           ${hits}
         </svg>
-        <span class="lbl" style="top:${num(thr)}%" aria-hidden="true">${esc(dur(t.threshold))} threshold</span>
+        <span class="lbl" style="top:${num(thr)}%" aria-hidden="true">${esc(dur(t.threshold))} goal</span>
       </div>
       <div class="ends" aria-hidden="true"><span>24 h ago</span><span>Now</span></div>`);
 }
 
-// 30 daily bars, oldest first. The bars are hidden from screen readers;
-// the sentence under them carries the same facts, and the table every number.
+// 30 daily bars, oldest first. The bars are hidden from screen readers; the key
+// under them carries the same facts, and the table in the details every number.
+// A missed day is also a shorter bar, so the strip still reads without colour.
 function history(v) {
   const { t, cal } = v;
   const count = { good: 0, warn: 0, bad: 0, none: 0 };
@@ -415,45 +440,54 @@ function history(v) {
     const tone = toneOf(burnRate(d.total, d.total - d.good, t.slo));
     count[tone]++;
     if (tone !== 'good' && (!worst || a < worst.a)) worst = { day, a };
-    return `<span class="${tone}" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} probes, ${LEVEL[tone]}`)}"></span>`;
+    return `<span class="${tone}" title="${esc(`${day}: ${pct(a)} up, ${d.good} of ${d.total} checks, ${LEVEL[tone]}`)}"></span>`;
   }).join('');
-  const parts = Object.keys(count).filter((k) => count[k])
-    .map((k) => `<span class="key"><i class="sw ${k}" aria-hidden="true"></i>${esc(`${count[k]} ${LEVEL[k]}`)}</span>`);
-  const low = worst ? ` Worst day ${worst.day} at ${pct(worst.a)}.` : '';
-  return `
-    <figure class="chart wide">
-      <figcaption><h3>Daily availability, 30 days</h3><p>One bar per UTC day against the ${esc(target(t.slo))} SLO. Hover a bar for its numbers.</p></figcaption>
-      <div aria-hidden="true">
-        <div class="strip">${bars}</div>
-        <div class="ends"><span>${esc(cal[0].day)}</span><span>Today</span></div>
-      </div>
-      <p class="daysum">Last 30 days: ${parts.join(', ')}.${esc(low)}</p>
-    </figure>`;
+  const key = Object.keys(count).filter((k) => count[k])
+    .map((k) => `<span class="key"><i class="sw ${k}" aria-hidden="true"></i>${esc(`${count[k]} ${LEVEL[k]}`)}</span>`).join('');
+  return { worst, key, strip: `
+  <div class="days">
+    <p class="k">Last 30 days <small>daily availability, goal ${esc(target(t.slo))}</small></p>
+    <div class="strip" aria-hidden="true">${bars}</div>
+    <div class="ends" aria-hidden="true"><span>${esc(cal[0].day)}</span><span>Today</span></div>
+  </div>` };
 }
 
-// The table twin of the strip and the burndown, newest day first, collapsed.
+// The table twin of the strip and the burndown, newest day first. A scroll box, not a
+// <details>: the 60 s reload would close a <details> while someone reads it.
 function table(v) {
+  const id = `${esc(v.t.id)}-dn`;
   const rows = v.cal.map(({ day, d }, i) => `<tr><td>${esc(day)}</td>${d
     ? `<td>${esc(d.total)}</td><td>${esc(d.total - d.good)}</td><td>${esc(pct(d.good / d.total))}</td>`
     : '<td colspan="3">No data</td>'}<td>${esc(pct(v.series[i], 1))}</td></tr>`).reverse().join('');
   return `
-    <details class="raw"><summary>Daily numbers</summary>
-      <div class="scroll"><table>
-        <thead><tr><th scope="col">Day, UTC</th><th scope="col">Probes</th><th scope="col">Failed</th><th scope="col">Up</th><th scope="col">Budget left</th></tr></thead>
+    <div class="raw">
+      <h3 id="${id}">Daily numbers</h3>
+      <div class="scroll" tabindex="0" role="region" aria-labelledby="${id}"><table>
+        <thead><tr><th scope="col">Day, UTC</th><th scope="col">Checks</th><th scope="col">Failed</th><th scope="col">Up</th><th scope="col">Budget left</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
-    </details>`;
+    </div>`;
 }
 
 const BURN = { good: 'Within the pace the SLO allows', warn: 'Faster than the SLO allows',
-  bad: 'Over 10x the pace the SLO allows', none: 'Too few probes in the last 24 h' };
+  bad: 'Over 10x the pace the SLO allows', none: 'Too few checks for a rate' };
 
-function panel(v, now) {
+// A service: at a glance first (state, one sentence, three numbers, the 30-day strip),
+// then the SRE detail, rendered open when the URL says ?open=<id>. The selection lives
+// in the query, which the meta refresh carries (see renderPage): a <details> closes on
+// every reload, and a #fragment cannot survive one (Chromium drops a fragment added by
+// a click, and a refresh to a URL with one never reloads). Each toggle is a page load;
+// the #fragment on the Show link only scrolls to the panel on that first load.
+function panel(v, now, open) {
   const { t, last } = v;
+  const id = esc(t.id);
+  const when = last && `<time datetime="${esc(new Date(last.ts).toISOString())}" title="${esc(stamp(last.ts))}">${esc(ago(now - last.ts))}</time>`;
   const head = `
-  <header class="phead">
-    <div><h2>${esc(t.name)}</h2><a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a></div>
+  <header class="phead" id="${id}-top">
     <span class="pill ${v.tone}">${icon(v.tone)}${v.label}</span>
+    <h2>${esc(t.name)}</h2>
+    <a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a>${last ? `
+    <p class="when">Checked ${when}</p>` : ''}
   </header>`;
 
   if (!last) {
@@ -463,49 +497,57 @@ function panel(v, now) {
     const wait = Math.max(1, Math.round((Math.ceil(now / every) * every - now) / 60_000));
     const next = t.source ? 'after the next GitHub Actions run' : `in about ${wait} min`;
     return `
-<section class="panel" id="${esc(t.id)}">${head}
+<section class="panel none" id="${id}">${head}
   <div class="empty">
-    <p><b>No probes yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive ${esc(next)}.</p>
-    <p>It will be held to ${esc(target(t.slo))} availability, with ${esc(target(t.latencySlo))} of good probes answering within ${esc(dur(t.threshold))}.</p>
+    <p><b>No checks yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive ${esc(next)}.</p>
+    <p>It will be held to ${esc(target(t.slo))} availability, with ${esc(target(t.latencySlo))} of good checks answering within ${esc(dur(t.threshold))}.</p>
   </div>
 </section>`;
   }
 
-  const result = last.status === null ? esc(last.err) : `HTTP ${esc(last.status)} in ${esc(dur(last.ms))}`;
-  const when = `<time datetime="${esc(new Date(last.ts).toISOString())}" title="${esc(stamp(last.ts))}">${esc(ago(now - last.ts))}</time>`;
-  const stale = v.state === 'stale'
-    ? `\n  <p class="last">Stale: no probe since then, though it should run ${esc(EVERY[t.cron] ?? t.cron)}. Its current state is unknown.</p>`
-    : '';
-  const verdict = (x, goal, what) => (x === null ? note('none', 'No data yet')
-    : x >= goal ? note('good', `Meets the ${target(goal)} ${what}`) : note('bad', `Below the ${target(goal)} ${what}`));
-
+  const availTone = v.avail === null ? 'none' : v.avail >= t.slo ? 'good' : 'bad';
   const b = budget(t, v.left);
-  const b24 = toneOf(v.burn24);
-  const hour = v.burn1 === null ? '<p class="s">Last 1 h: too few probes for a rate</p>' : note(toneOf(v.burn1), `Last 1 h: ${rate(v.burn1)}`);
-  const newest = {
-    up: [dur(last.ms), 'good', `Under the ${dur(t.threshold)} threshold`],
-    slow: [dur(last.ms), 'warn', `Over the ${dur(t.threshold)} threshold`],
-    down: ['Failed', 'bad', last.status === null ? 'No response' : `HTTP ${last.status}`],
-    stale: [last.ok ? dur(last.ms) : 'Failed', 'none', `${ago(now - last.ts)}, current state unknown`],
+  const [nowValue, nowTone, nowNote] = {
+    up: [dur(last.ms), 'good', `Under the ${dur(t.threshold)} goal`],
+    slow: [dur(last.ms), 'warn', `Over the ${dur(t.threshold)} goal`],
+    down: [last.status === null ? 'No answer' : `HTTP ${last.status}`, 'bad', 'The last check failed'],
+    stale: [last.ok ? dur(last.ms) : 'Failed', 'none', 'Out of date'],
   }[v.state];
+  const h = history(v);
+  const b24 = toneOf(v.burn24);
+  const b1 = toneOf(v.burn1);
+  const result = last.status === null ? esc(last.err) : `HTTP ${esc(last.status)} in ${esc(dur(last.ms))}`;
+  const goal = (x, g, what) => (x === null ? note('none', 'No data yet')
+    : note(x >= g ? 'good' : 'bad', `${x >= g ? 'Meets' : 'Below'} the ${target(g)} ${what}`));
 
   return `
-<section class="panel${v.state === 'down' ? ' is-down' : ''}" id="${esc(t.id)}">${head}
-  <p class="last${last.ok ? '' : ' bad'}">Last probe ${when}${last.ok ? '' : ' failed'}: ${result}</p>${stale}
-  <div class="kpis">${kpi(v.avail === null ? 'none' : v.avail >= t.slo ? 'good' : 'bad', 'Availability, 30 days',
-    v.avail === null ? 'No data' : pct(v.avail), verdict(v.avail, t.slo, 'SLO'))}${kpi(b.tone, 'Error budget left',
-    b.value, `${note(b.tone, b.text)}<div class="bar" aria-hidden="true">${b.bar}</div>`)}${kpi(b24, 'Burn rate, last 24 h',
-    v.burn24 === null ? 'No data' : rate(v.burn24), `${note(b24, BURN[b24])}${hour}<p class="s">1.0x = on pace to spend the budget in exactly 30 days</p>`)}${kpi(newest[1], 'Newest probe',
-    newest[0], note(newest[1], newest[2]))}
+<section class="panel ${v.tone}${open ? ' open' : ''}" id="${id}">${head}
+  <p class="lead">${esc(sentence(v, now))}</p>
+  <div class="figs">${fig(availTone, 'Up time, 30 days', 'availability',
+    esc(v.avail === null ? 'No data' : pct(v.avail)), goal(v.avail, t.slo, 'goal'))}${fig(nowTone, 'Response time', 'newest check',
+    esc(nowValue), note(nowTone, nowNote))}${fig(`${b.tone} wide`, 'Downtime allowance left', 'error budget',
+    b.value, `<div class="meter" aria-hidden="true">${b.bar}</div>${note(b.tone, b.text)}`)}
+  </div>${h.strip}
+  <div class="foot">
+    <p class="daysum">${h.key}</p>
+    <a class="toggle show" href="?open=${id}#${id}" aria-label="Show details for ${esc(t.name)}">Show details</a>
+    <a class="toggle hide" href="/#${id}-top" aria-label="Hide details for ${esc(t.name)}">Hide details</a>
   </div>
-  <dl class="minor">
-    <div><dt>p95, last 24 h</dt><dd><b>${esc(v.p95 === null ? 'No data' : dur(v.p95))}</b> good probes only</dd></div>
-    <div><dt>Latency SLI, 30 days</dt><dd><b>${esc(v.lat === null ? 'No data' : pct(v.lat))}</b> under ${esc(dur(t.threshold))}${verdict(v.lat, t.latencySlo, 'target')}</dd></div>
-    <div><dt>Probed</dt><dd>${esc(EVERY[t.cron] ?? t.cron)} from ${t.source ? 'GitHub Actions' : 'Cloudflare'}</dd></div>
-    <div><dt>Window</dt><dd>${esc(WINDOW_DAYS)} UTC days, ${esc(v.cal.filter(({ d }) => d).length)} with data</dd></div>
-  </dl>
-  <div class="charts">${burndownChart(v)}${latencyChart(v, now)}
-  </div>${history(v)}${v.left === null ? '' : table(v)}
+  <div class="more">
+    <dl class="minor">${row('Spending rate, 24 h', 'burn rate', esc(v.burn24 === null ? 'No data' : rate(v.burn24)),
+      note(b24, BURN[b24]))}${row('Spending rate, 1 h', 'burn rate', esc(v.burn1 === null ? 'No data' : rate(v.burn1)),
+      note(b1, BURN[b1]))}${row('95% answered within', 'p95, 24 h', esc(v.p95 === null ? 'No data' : dur(v.p95)),
+      '<p class="s">Answered checks only</p>')}${row(`Answers under ${dur(t.threshold)}, 30 days`, 'latency SLI',
+      esc(v.lat === null ? 'No data' : pct(v.lat)), goal(v.lat, t.latencySlo, 'target'))}${row('Last check', '', result,
+      `<p class="s">${esc(stamp(last.ts))}</p>`)}${row('Checked', '', esc(EVERY[t.cron] ?? t.cron),
+      `<p class="s">From ${t.source ? 'GitHub Actions' : 'Cloudflare'}</p>`)}${row('Days with data', '',
+      esc(`${v.cal.filter(({ d }) => d).length} of ${WINDOW_DAYS}`),
+      h.worst ? `<p class="s">${esc(`Worst: ${h.worst.day}, ${pct(h.worst.a)} up`)}</p>` : '')}
+    </dl>
+    <p class="hint">Spending rate: 1.0x = on pace to use the whole allowance in exactly 30 days. 10x would use it in 3.</p>
+    <div class="charts">${burndownChart(v)}${latencyChart(v, now)}
+    </div>${v.left === null ? '' : table(v)}
+  </div>
 </section>`;
 }
 
@@ -514,7 +556,13 @@ const DOT = { good: '2e8b57', warn: 'b8800f', bad: 'b3301f', none: '8a8273' };
 const favicon = (tone) => "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
   + `%3Ccircle cx='8' cy='8' r='7' fill='%23${DOT[tone]}'/%3E%3C/svg%3E`;
 
-function renderPage(stats, now) {
+// open: the ?open= value. Only a known id gets through, so nothing else reaches the page.
+function renderPage(stats, now, open = null) {
+  const sel = open === 'how' || TARGETS.some((t) => t.id === open) ? open : null;
+  // The refresh names its URL, with the selection and no #fragment. A bare refresh
+  // reuses the page's URL, and Chromium treats a URL with a fragment as a jump within
+  // the page: it scrolls back to the fragment and never loads new data.
+  const again = sel ? `/?open=${sel}` : '/';
   const views = stats.map((s) => derive(s, now));
   const { tone, head, notes } = overall(views, now);
   // source is only ever 'github' for now.
@@ -526,7 +574,7 @@ function renderPage(stats, now) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta http-equiv="refresh" content="60">
+<meta http-equiv="refresh" content="60; url=${esc(again)}">
 <title>${esc(head)} | Uptime and SLOs</title>
 <link rel="icon" href="${favicon(tone)}">
 <style>
@@ -555,14 +603,13 @@ function renderPage(stats, now) {
   p { margin: 0; }
   a { color: var(--link); text-underline-offset: 2px; }
   /* Teal, not red: red already means down on this page. */
-  a:focus-visible, summary:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 4px; }
-  .top { padding: 20px 0 4px; font-size: .9rem; }
-  .top a { font-weight: 600; text-decoration: none; }
-  .top a:hover { text-decoration: underline; }
+  a:focus-visible, .scroll:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 4px; }
+  /* The technical term next to a plain label: there for an SRE, quiet for everyone else. */
+  small { font-size: .8em; font-weight: 400; color: var(--muted); white-space: nowrap; }
   h1 { font-size: 1.75rem; line-height: 1.2; letter-spacing: -.01em; margin: 12px 0 4px; }
   h2 { font-size: 1.3rem; line-height: 1.3; margin: 0; }
   h3 { font-size: .95rem; line-height: 1.3; margin: 0; }
-  .sub, .host, .last, dt, .ends, .daysum, .meta, figcaption p, footer, .nodata { color: var(--muted); }
+  .sub, .host, .when, dt, .ends, .daysum, .hint, .meta, figcaption p, footer, .nodata { color: var(--muted); }
   .sub { margin-bottom: 16px; }
 
   /* One tone per state. --c is the swatch, --ci the text shade, --on the glyph inside an icon. */
@@ -575,60 +622,91 @@ function renderPage(stats, now) {
   .icon .g { fill: none; stroke: var(--on); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .icon .d { fill: none; stroke: var(--ci); stroke-width: 1.6; stroke-dasharray: 2.6 2.1; }
 
+  /* The header says the page is live and when it will reload. The dot is the
+     text shade of the overall tone, so it clears 3:1 on the page in every state. */
+  .top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px;
+    padding: 20px 0 4px; font-size: .9rem; }
+  .top > a { font-weight: 600; text-decoration: none; }
+  .top > a:hover { text-decoration: underline; }
+  .live { position: relative; display: flex; align-items: center; gap: 8px; padding-bottom: 6px; font-size: .85rem; color: var(--muted); }
+  .live b { color: var(--text); font-weight: 650; }
+  .live i { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--ci); }
+  /* Drains over the 60 s until the meta refresh. Shown only with motion on. */
+  .tick { display: none; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; border-radius: 2px;
+    overflow: hidden; background: var(--line); }
+  .tick::before { content: ""; display: block; height: 100%; background: var(--muted); transform-origin: left; }
+
   /* 1. The whole page in words. */
-  .banner { display: grid; gap: 4px; padding: 16px 20px; margin-bottom: 16px; border-radius: 12px;
+  .banner { display: grid; gap: 4px; padding: 16px 20px; margin-bottom: 20px; border-radius: 12px;
     border: 1px solid color-mix(in srgb, var(--c) 45%, var(--line));
     background: color-mix(in srgb, var(--c) 12%, var(--card)); }
   .banner h2 { display: flex; align-items: center; gap: 10px; font-size: 1.45rem; }
   .meta { font-size: .85rem; }
 
-  /* 2. Each service, scannable across one row. Only trouble gets a coloured edge. */
-  .tiles { list-style: none; padding: 0; margin: 0 0 28px; display: grid; gap: 12px;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
-  .tile { display: grid; gap: 2px; height: 100%; padding: 12px 16px 14px; border-radius: 10px; color: inherit; text-decoration: none;
-    background: var(--card); border: 1px solid var(--line); border-top: 4px solid var(--line); }
-  .tile.warn, .tile.bad { border-top-color: var(--c); }
-  .tile:hover { background: color-mix(in srgb, var(--text) 4%, var(--card)); }
-  .tile .state { display: flex; align-items: center; gap: 6px; font-size: .85rem; font-weight: 650; color: var(--ci); }
-  .tile .name { font-size: 1.1rem; font-weight: 650; }
-  .tile .figs { display: flex; flex-wrap: wrap; gap: 0 16px; font-size: .85rem; color: var(--muted); }
-  .tile .figs b { color: var(--text); font-size: 1rem; font-weight: 650; }
-
-  /* 3. One panel per service: state, then SLO numbers, then charts, then raw numbers. */
-  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 24px 22px;
-    margin-bottom: 20px; scroll-margin-top: 12px; }
-  .panel.is-down { border-color: var(--bad); }
-  .phead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  /* 2. One panel per service: state and a sentence, three big numbers, the strip.
+     Only trouble gets a coloured edge. */
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 24px;
+    margin-bottom: 16px; scroll-margin-top: 12px; }
+  .panel.warn, .panel.bad { border-color: var(--c); border-top-width: 4px; }
+  .phead { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; scroll-margin-top: 12px; }
+  .phead .when { margin-left: auto; font-size: .85rem; }
   .host { font-size: .9rem; }
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; white-space: nowrap;
     font-size: .85rem; font-weight: 650; color: var(--ci); background: color-mix(in srgb, var(--c) 16%, var(--card));
     border: 1px solid color-mix(in srgb, var(--c) 45%, transparent); }
-  .last { font-size: .9rem; margin-top: 8px; overflow-wrap: anywhere; }
-  .last.bad { color: var(--ci); }
+  .lead { margin-top: 10px; font-size: 1.05rem; max-width: 64ch; }
 
-  .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
-  .kpi { display: grid; align-content: start; gap: 4px; min-width: 0; padding: 12px 14px 14px; border-radius: 10px;
-    border: 1px solid var(--line); border-top: 3px solid var(--line); }
-  .kpi.warn, .kpi.bad { border-top-color: var(--c); }
-  .kpi .k { font-size: .8rem; color: var(--muted); }
-  .kpi .v { font-size: 1.75rem; font-weight: 650; line-height: 1.15; letter-spacing: -.01em; }
+  .figs { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 16px 32px; margin-top: 18px; }
+  .fig { display: grid; align-content: start; gap: 4px; min-width: 0; }
+  .k { font-size: .85rem; color: var(--muted); }
+  .fig .v { font-size: 2.1rem; font-weight: 650; line-height: 1.1; letter-spacing: -.02em; }
+  .fig .v small { font-size: .45em; letter-spacing: 0; font-weight: 500; }
+  .fig .v.word { font-size: 1.5rem; line-height: 1.55; letter-spacing: -.01em; }
   .s { display: flex; align-items: flex-start; gap: 6px; font-size: .8rem; line-height: 1.35; color: var(--muted); }
   .s .icon { margin-top: .15em; }
   .s.good, .s.warn, .s.bad { color: var(--ci); font-weight: 600; }
-  .bar { height: 6px; margin-top: 4px; border-radius: 999px; background: var(--track); overflow: hidden; }
-  .bar span { display: block; height: 100%; background: var(--c); }
+  /* The track is a pale step of the fill's own tone, so the state reads across the whole bar. */
+  .meter { height: 8px; margin: 6px 0 2px; border-radius: 999px; overflow: hidden;
+    background: color-mix(in srgb, var(--c) 20%, var(--track)); }
+  .meter span { display: block; height: 100%; border-radius: 999px; background: var(--c); }
   /* Overspent: a full bar, striped, so it does not read as a full budget. */
-  .bar .over { width: 100%; background: repeating-linear-gradient(135deg, var(--bad) 0 6px, transparent 6px 10px); }
+  .meter .over { width: 100%; background: repeating-linear-gradient(135deg, var(--bad) 0 6px, transparent 6px 10px); }
 
-  .minor { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 24px; margin: 14px 0 0; padding: 0 2px; }
-  dt { font-size: .75rem; }
-  dd { margin: 0; font-size: .85rem; color: var(--muted); }
-  dd b { color: var(--text); font-size: 1rem; font-weight: 650; margin-right: 4px; }
-  dd .s { margin-top: 2px; }
+  .days { margin-top: 20px; }
+  .strip { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); align-items: end; gap: 3px; height: 32px; margin-top: 8px; }
+  .strip span { height: 100%; border-radius: 2px; background: var(--c); }
+  .strip .warn { height: 70%; }
+  .strip .bad { height: 45%; }
+  .strip span:hover { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--text); }
+  /* No data is hollow and dashed, like the no-data icon, so it is not a colour to learn. */
+  .strip .none, .sw.none { background: transparent; border: 1.5px dashed color-mix(in srgb, var(--muted) 60%, transparent); }
+  .ends { display: flex; justify-content: space-between; font-size: .75rem; margin-top: 4px; }
+  .foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-top: 10px; }
+  .daysum { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: .8rem; }
+  .key { white-space: nowrap; }
+  .sw { display: inline-block; width: 9px; height: 13px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; background: var(--c); }
 
-  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
+  /* 3. The SRE detail, one service at a time, open when the server marks its panel .open. */
+  .toggle { display: inline-flex; align-items: center; gap: 8px; padding: 5px 14px; border-radius: 999px;
+    border: 1px solid var(--line); font-size: .85rem; font-weight: 600; text-decoration: none; }
+  .toggle::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 2px 2px 0;
+    transform: translateY(-2px) rotate(45deg); }
+  .toggle.hide::after { transform: translateY(2px) rotate(-135deg); }
+  .toggle:hover { background: color-mix(in srgb, var(--link) 10%, var(--card)); border-color: color-mix(in srgb, var(--link) 45%, var(--line)); }
+  .more, .hide { display: none; }
+  .open .show { display: none; }
+  .open .hide { display: inline-flex; }
+  /* minmax(0, 1fr): an auto column would grow to the detail grid's min-content and overflow a phone. */
+  .open .more { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
+
+  .minor { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr)); gap: 14px 24px; margin: 0; }
+  dt { font-size: .8rem; }
+  dd { display: grid; gap: 2px; margin: 2px 0 0; }
+  dd b { font-size: 1.05rem; font-weight: 650; overflow-wrap: anywhere; }
+  .hint { font-size: .8rem; }
+
+  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
   .chart { margin: 0; min-width: 0; padding: 14px 16px 12px; border: 1px solid var(--line); border-radius: 10px; }
-  .chart.wide { margin-top: 16px; }
   figcaption p { font-size: .8rem; }
   .plot { position: relative; height: 160px; margin-top: 12px; }
   .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
@@ -654,85 +732,117 @@ function renderPage(stats, now) {
   .lbl.end.bad { color: var(--bad-ink); }
   .nodata { font-size: .9rem; padding: 40px 0; text-align: center; }
 
-  .strip { display: grid; grid-template-columns: repeat(${WINDOW_DAYS}, 1fr); gap: 3px; height: 34px; margin-top: 12px; }
-  .strip span { border-radius: 2px; background: var(--c); }
-  .strip span:hover { opacity: .7; }
-  /* No data is hollow and dashed, like the no-data icon, so it is not a colour to learn. */
-  .strip span.none, .sw.none { background: transparent; border: 1.5px dashed color-mix(in srgb, var(--muted) 60%, transparent); }
-  .ends { display: flex; justify-content: space-between; font-size: .75rem; margin-top: 4px; }
-  .daysum { font-size: .85rem; margin-top: 8px; }
-  .key { white-space: nowrap; }
-  .sw { display: inline-block; width: 9px; height: 13px; margin-right: 5px; border-radius: 2px; vertical-align: -1px; background: var(--c); }
-
-  .raw { margin-top: 14px; font-size: .85rem; }
-  summary { cursor: pointer; color: var(--link); font-weight: 600; }
-  .scroll { overflow-x: auto; margin-top: 8px; }
+  .raw { font-size: .85rem; }
+  .scroll { max-height: 15rem; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th:first-child, td:first-child { text-align: left; padding-left: 0; }
-  th { font-weight: 600; font-size: .78rem; color: var(--muted); }
+  th, td { text-align: right; padding: 4px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { position: sticky; top: 0; font-weight: 600; font-size: .78rem; color: var(--muted); background: var(--card); }
 
   .empty { display: grid; gap: 6px; margin-top: 14px; padding: 14px 16px; border-radius: 8px; font-size: .9rem;
     color: var(--muted); border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent); }
   .empty b { color: var(--text); }
 
-  /* 4. How it is measured, collapsed at the bottom. */
-  footer { display: grid; gap: 10px; font-size: .85rem; border-top: 1px solid var(--line); margin-top: 24px; padding-top: 16px; }
-  footer details > div { display: grid; gap: 8px; margin-top: 10px; }
+  /* 4. How it is measured, at the bottom, opened the same way as a service's detail. */
+  footer { display: grid; justify-items: start; gap: 12px; font-size: .85rem; border-top: 1px solid var(--line);
+    margin-top: 24px; padding-top: 16px; scroll-margin-top: 12px; }
+  footer.open .more { gap: 8px; }
   footer ul { margin: 0; padding-left: 20px; }
 
   @media (max-width: 760px) {
-    .kpis, .minor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .charts { grid-template-columns: minmax(0, 1fr); }
   }
-  @media (max-width: 480px) {
+  @media (max-width: 560px) {
     h1 { font-size: 1.5rem; }
     .banner h2 { font-size: 1.25rem; }
     .panel { padding: 16px; }
-    .kpi { padding: 10px 12px 12px; }
-    .kpi .v { font-size: 1.4rem; }
+    .phead .when { margin-left: 0; flex-basis: 100%; }
+    .figs { grid-template-columns: 1fr 1fr; gap: 16px; }
+    .fig.wide { grid-column: 1 / -1; }
+    .fig .v { font-size: 1.75rem; }
     .chart { padding: 12px; }
     .strip { gap: 2px; height: 28px; }
   }
+
+  /* Motion, only for people who have not asked for less. Every entrance animates
+     from a start state back to the resting style, so with motion off the page is
+     already complete. The page reloads every minute and the entrances replay, so
+     each is under 0.8 s and only on marks that carry data: a replay reads as fresh
+     numbers arriving, and the chrome around them stays still. */
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+    .tick { display: block; }
+    .tick::before { animation: drain 60s linear forwards; }
+    /* Three beats after each load, only when everything is up. Under 5 s, so it
+       stays clear of WCAG 2.2.2, which asks for a pause control on longer motion. */
+    .live.good i::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: inherit;
+      animation: ping 1.5s ease-out 3 both; }
+    .fig .v { animation: rise-in .45s ease-out backwards; }
+    .fig + .fig .v { animation-delay: 60ms; }
+    .fig + .fig + .fig .v { animation-delay: 120ms; }
+    .meter span { transform-origin: left; animation: grow .8s cubic-bezier(.2, .8, .2, 1) .15s backwards; }
+    /* Oldest day first, so the wave ends on today. sibling-index() is newer than the
+       rest; where it is missing, every bar rises at once. */
+    .strip span { transform-origin: bottom; animation: lift .4s cubic-bezier(.2, .8, .2, 1) backwards;
+      animation-delay: calc(sibling-index() * 10ms); transition: transform .15s ease-out; }
+    .strip span:hover { transform: scaleY(1.12); }
+    .open .more { animation: rise-in .3s ease-out backwards; }
+    /* A wipe, not stroke-dashoffset: non-scaling-stroke measures dashes on screen,
+       so a dash-based draw-in would end at a different length on every chart width. */
+    .plot svg { animation: wipe .8s cubic-bezier(.4, 0, .2, 1) .1s backwards; }
+    .plot .lbl { animation: fade .3s ease-out .6s backwards; }
+    .hit { transition: fill .15s; }
+    .toggle { transition: background-color .15s, border-color .15s; }
+  }
+  @keyframes drain { to { transform: scaleX(0); } }
+  @keyframes ping { from { opacity: .6; } to { transform: scale(3); opacity: 0; } }
+  @keyframes rise-in { from { opacity: 0; transform: translateY(6px); } }
+  @keyframes grow { from { transform: scaleX(0); } }
+  @keyframes lift { from { transform: scaleY(0); } }
+  /* The plot overflows its box (end dots, ticks), so the open end is past every edge. */
+  @keyframes wipe { from { clip-path: inset(-20px 100% -20px -20px); } to { clip-path: inset(-20px); } }
+  @keyframes fade { from { opacity: 0; } }
 </style>
 </head>
 <body>
 <div class="wrap">
-<header class="top"><a href="https://theoith.ink/">&larr; theoith.ink</a></header>
+<header class="top">
+  <a href="https://theoith.ink/">&larr; theoith.ink</a>
+  <p class="live ${tone}"><i aria-hidden="true"></i><b>Live</b><span aria-hidden="true">&middot;</span><span>Refreshes every minute</span><span class="tick" aria-hidden="true"></span></p>
+</header>
 <main>
   <h1>Uptime and SLOs</h1>
-  <p class="sub">Availability and latency against written SLOs, over a rolling 30-day window in UTC days.</p>
+  <p class="sub">Whether my sites are up right now, and how reliable they have been over the last 30 days.</p>
   <section class="banner ${tone}" aria-labelledby="overall">
     <h2 id="overall">${icon(tone)}${esc(head)}</h2>
     ${notes.length ? `<p>${esc(notes.join(' '))}</p>` : ''}
-    <p class="meta">Page built <time datetime="${esc(new Date(now).toISOString())}">${esc(stamp(now))}</time>. It reloads itself every minute.</p>
+    <p class="meta">Updated <time datetime="${esc(new Date(now).toISOString())}">${esc(stamp(now))}</time>.</p>
   </section>
-  <ul class="tiles" aria-label="Services at a glance">${views.map(tile).join('')}
-  </ul>
-  ${views.map((v) => panel(v, now)).join('')}
+  ${views.map((v) => panel(v, now, sel === v.t.id)).join('')}
 </main>
-<footer>
-  <p>The two Cloudflare-hosted sites are probed from Cloudflare, so this page shares fate with them:
+<footer id="how"${sel === 'how' ? ' class="open"' : ''}>
+  <p id="how-top">The two Cloudflare-hosted sites are checked from Cloudflare, so this page shares fate with them:
     a Cloudflare outage can take those sites, this page and the alerts down together.</p>
   ${PAUSED.map((t) => `<p>Paused: ${esc(t.name)} (${esc(new URL(t.url).host)}). ${esc(t.why)}</p>`).join('')}
-  <details>
-    <summary>How this is measured</summary>
-    <div>
-      <p>What is probed, and how often. A probe is up when the site answers 2xx within the timeout.
-        The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.
-        Stale means no probe has arrived for ${esc(STALE_AFTER)} of its intervals, so its current state is unknown.</p>
-      <ul>${probed}</ul>
-      <p>The error budget is the number of probes allowed to fail in a full 30-day window, (1 &minus; SLO) &times; the window's probes,
-        so a failure on day one costs what it would on day 30. The burndown starts the window at 100% and drops with each failed probe.
-        Burn rate is the error rate over a recent window divided by the rate the SLO allows: 1.0x would spend the budget in exactly 30 days.</p>
-      <p>The two Cloudflare-hosted sites are probed by a Cloudflare Cron Trigger, from whichever Cloudflare data center
-        picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
-        those sites and this page can go down together, and no alert goes out.</p>
-      <p>Hulog is probed by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
-        onrender.com blocks requests from Cloudflare Workers, so a probe from Cloudflare would measure that block, not Hulog.
-        GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
-    </div>
-  </details>
+  <a class="toggle show" href="?open=how#how">How this is measured</a>
+  <a class="toggle hide" href="/#how-top">Hide how this is measured</a>
+  <div class="more">
+    <p>A check (a probe) is up when the site answers 2xx within the timeout.
+      The badge on each service is its newest check. Slow means it answered, but slower than its response-time goal.
+      Stale means no check has arrived for ${esc(STALE_AFTER)} of its intervals, so its current state is unknown.</p>
+    <ul>${probed}</ul>
+    <p>Up time (availability) is good checks out of all checks over the last 30 UTC days. The downtime allowance
+      (error budget) is how many checks may fail in a full 30-day window, (1 &minus; SLO) &times; the window's checks,
+      shown as minutes of downtime: 99.9% allows 43.2 minutes. A failure on day one costs what it would on day 30.
+      Spending rate (burn rate) is the failure rate over a recent window divided by the rate the SLO allows:
+      1.0x would use the allowance in exactly 30 days.</p>
+    <p>The two Cloudflare-hosted sites are checked by a Cloudflare Cron Trigger, from whichever Cloudflare data center
+      picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
+      those sites and this page can go down together, and no alert goes out.</p>
+    <p>Hulog is checked by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
+      onrender.com blocks requests from Cloudflare Workers, so a check from Cloudflare would measure that block, not Hulog.
+      GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
+  </div>
 </footer>
 </div>
 </body>
@@ -825,7 +935,7 @@ export default {
   },
 
   async fetch(request, env) {
-    const { pathname } = new URL(request.url);
+    const { pathname, searchParams } = new URL(request.url);
     if (pathname === '/ingest') {
       if (request.method !== 'POST') return text('Method not allowed\n', 405, { allow: 'POST' });
       return ingest(request, env);
@@ -835,7 +945,7 @@ export default {
       return text('Method not allowed\n', 405, { allow: 'GET, HEAD' });
     }
     const now = Date.now();
-    const html = renderPage(await loadStats(env, now), now);
+    const html = renderPage(await loadStats(env, now), now, searchParams.get('open'));
     return new Response(html, { headers: { ...HEADERS, 'content-type': 'text/html; charset=utf-8' } });
   },
 };

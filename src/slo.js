@@ -64,6 +64,15 @@ export function percentile(values, p) {
   return sorted[Math.max(rank, 1) - 1];
 }
 
+// When the current outage started: the ts of the first failure in the newest run of
+// failed probes, or null when the newest probe is ok. probes is oldest first.
+// whole is true when every probe given failed, so the outage may be older than the list.
+export function failingSince(probes) {
+  let i = probes.length;
+  while (i > 0 && !probes[i - 1].ok) i--;
+  return i === probes.length ? null : { ts: probes[i].ts, whole: i === 0 };
+}
+
 // How many probes in a row failed, starting at index `from`. Newest first.
 function failsFrom(oks, from) {
   let i = from;

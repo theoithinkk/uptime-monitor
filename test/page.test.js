@@ -16,8 +16,8 @@ function fakeDB(data) {
   };
 }
 
-async function page(data) {
-  const res = await worker.fetch(new Request('http://localhost/'), { DB: fakeDB(data) });
+async function page(data, path = '/') {
+  const res = await worker.fetch(new Request(`http://localhost${path}`), { DB: fakeDB(data) });
   return { res, html: await res.text() };
 }
 
@@ -46,8 +46,8 @@ test('status page escapes database text and ships no script', async () => {
 
 test('status page with no probes at all says it is waiting', async () => {
   const { html } = await page({});
-  assert.match(html, /Waiting for first probes/);
-  assert.match(html, /No probes yet/);
+  assert.match(html, /Waiting for first checks/);
+  assert.match(html, /No checks yet/);
 });
 
 // The panel for one service, so a badge check cannot match another panel.
@@ -69,8 +69,10 @@ test('burndown, burn rate and badges on a service that is down and overspent', a
   // The burndown is not clipped at zero: the overspend is labelled on the chart.
   assert.match(w, /class="lbl end bad[^"]*"[^>]*>overspent by 4\.2%</);
   assert.match(w, /It ran out on /);
+  // The lead sentence comes from the same numbers: down since the first of the 9 failures.
+  assert.match(w, /<p class="lead">Down for 45 minutes\. It has used more than its whole downtime allowance for the last 30 days\.<\/p>/);
   // 9 of 12 failed in the last hour at a 99.9% SLO is 750x; 1.0x is explained in words.
-  assert.match(w, /Last 1 h: 750x/);
+  assert.match(w, /Spending rate, 1 h[^]*?<b>750x<\/b>/);
   assert.match(w, /1\.0x = on pace/);
   // The latency line breaks at failures and marks each one with a tick.
   assert.equal((w.match(/V88/g) ?? []).length, 9);
@@ -84,10 +86,11 @@ test('a probe older than 3 intervals is Stale, never Up, and the banner counts i
   const hulog = cardOf(html, 'Hulog');
   assert.match(hulog, /<span class="pill none"><svg[^]*?<\/svg>Stale<\/span>/);
   assert.doesNotMatch(hulog, />Up</);
-  assert.match(hulog, /Stale: no probe since then, though it should run every hour/);
-  assert.match(hulog, /Last probe <time[^>]*>3 h ago<\/time>: HTTP 200 in 36\.6 s/);
+  assert.match(hulog, /No check for 3 hours, so its current state is unknown\./);
+  assert.match(hulog, /Checked <time[^>]*>3 hours ago<\/time>/);
+  assert.match(hulog, /<b>HTTP 200 in 36\.6 s<\/b>/);
   assert.match(html, /<section class="banner none"[^]*1 service stale/);
-  assert.match(html, /Stale, no recent probe: Hulog\./);
+  assert.match(html, /Stale, no recent check: Hulog\./);
   assert.doesNotMatch(html, /All services operational/);
 
   // Just inside 3 intervals it is still a normal result.
@@ -98,4 +101,51 @@ test('a probe older than 3 intervals is Stale, never Up, and the banner counts i
   // The 5-minute sites go Stale after 15 minutes without a probe.
   const cron = await page({ portfolio: up(16 * 60_000), writeups: up(60_000), hulog: up(60_000, 36_600) });
   assert.match(cardOf(cron.html, 'Portfolio'), /<span class="pill none"><svg[^]*?<\/svg>Stale<\/span>/);
+});
+
+test('a healthy service leads with one plain sentence built from its numbers', async () => {
+  const now = Date.now();
+  // 30 full days with 2 failed probes: 99.98% up, 2 of the 8.64 allowed failures spent.
+  const days = Array.from({ length: 30 }, (_, i) => ({
+    day: new Date(now - i * 86_400_000).toISOString().slice(0, 10), total: 288, good: i < 2 ? 287 : 288, fast: 280,
+  }));
+  const { html } = await page({ portfolio: { probes: [{ ts: now - 60_000, ok: 1, status: 200, ms: 143, err: null }], days } });
+  const p = cardOf(html, 'Portfolio');
+  assert.match(p, /<p class="lead">Healthy\. 99\.98% up over 30 days, 33 of 43 minutes of allowed downtime left\.<\/p>/);
+  assert.match(p, /33 <small>of 43 min<\/small>/);
+  assert.match(p, /<a class="toggle show" href="\?open=portfolio#portfolio"/);
+  assert.match(p, /<a class="toggle hide" href="\/#portfolio-top"/);
+});
+
+test('?open= opens one known panel, and its value never reaches the page', async () => {
+  const data = { writeups: { probes: [{ ts: Date.now() - 60_000, ok: 1, status: 200, ms: 150, err: null }], days: [] } };
+  const { html } = await page(data, '/?open=writeups');
+  assert.match(html, /<section class="panel good open" id="writeups">/);
+  assert.equal((html.match(/ open"/g) ?? []).length, 1);
+  // The refresh keeps the selection and never has a #fragment: Chromium treats a
+  // refresh to a URL with one as a scroll within the page and stops reloading.
+  assert.match(html, /<meta http-equiv="refresh" content="60; url=\/\?open=writeups">/);
+  assert.match((await page(data, '/?open=how')).html, /<footer id="how" class="open">/);
+  const odd = await page(data, '/?open=%3Cb%3Ex');
+  assert.doesNotMatch(odd.html, / open"|<b>x/);
+  assert.match(odd.html, /<meta http-equiv="refresh" content="60; url=\/">/);
+});
+
+test('every animation and transition sits behind prefers-reduced-motion', async () => {
+  const { html } = await page({});
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+  const gate = '@media (prefers-reduced-motion: no-preference) {';
+  const start = css.indexOf(gate);
+  assert.ok(start > 0);
+  // Cut the gated block out by matching braces; nothing left over may move.
+  let depth = 0;
+  let end = start;
+  do {
+    if (css[end] === '{') depth++;
+    if (css[end] === '}') depth--;
+    end++;
+  } while (depth > 0 || end <= start + gate.length);
+  const ungated = css.slice(0, start) + css.slice(end);
+  assert.doesNotMatch(ungated, /(animation|transition|scroll-behavior)(-[a-z]+)?\s*:/);
+  assert.match(css.slice(start, end), /animation: drain 60s linear/);
 });
