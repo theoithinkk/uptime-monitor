@@ -10,24 +10,33 @@ const TARGETS = [
     cron: '*/5 * * * *', timeout: 10_000, threshold: 1000, slo: 0.999, latencySlo: 0.99 },
   { id: 'writeups', name: 'CTF writeups', url: 'https://writeups.theoith.ink/',
     cron: '*/5 * * * *', timeout: 10_000, threshold: 1000, slo: 0.999, latencySlo: 0.99 },
-];
-// Not probed and not shown as a card; the page footer says why. Settings are
-// kept so a target can move back into TARGETS unchanged.
-const PAUSED = [
   // Render's free tier sleeps after 15 idle minutes. Probing hourly lets it
   // sleep, so this measures the cold start a real visitor gets.
-  // Paused 2026-11-22: Cloudflare's bot check in front of onrender.com answers
-  // requests from Workers with 429 and cf-mitigated: challenge.
-  { id: 'hulog', name: 'Hulog', url: 'https://hulog.onrender.com/',
-    cron: '0 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95,
-    why: 'The bot check in front of onrender.com blocks requests sent from Cloudflare Workers (HTTP 429), '
-      + 'so a probe from here would measure that block, not Hulog. It comes back once it is probed from outside Cloudflare.' },
+  // source: the probe runs outside Cloudflare and POSTs its result to /ingest,
+  // because the bot check in front of onrender.com blocks requests from Workers.
+  // The cron is the schedule in .github/workflows/probe-hulog.yml.
+  { id: 'hulog', name: 'Hulog', url: 'https://hulog.onrender.com/', source: 'github',
+    cron: '7 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95 },
 ];
-// Must match the crons in wrangler.toml.
-const EVERY = { '*/5 * * * *': 'every 5 minutes', '0 * * * *': 'every hour' };
+// The only targets /ingest accepts. Anything else is a 404.
+const EXTERNAL = new Map(TARGETS.filter((t) => t.source).map((t) => [t.id, t]));
+// Not probed and not shown as a card; the page footer names each one and its
+// `why`. Empty for now. A paused target keeps its settings so it can move back.
+const PAUSED = [];
+// Must match the crons in wrangler.toml, or the workflow for an external target.
+const EVERY = { '*/5 * * * *': 'every 5 minutes', '7 * * * *': 'every hour' };
 // Probes per day for each cron. The error budget is counted against a full
 // window of probes, so a failure on day one costs what it would on day 30.
-const PER_DAY = { '*/5 * * * *': 288, '0 * * * *': 24 };
+const PER_DAY = { '*/5 * * * *': 288, '7 * * * *': 24 };
+// A target is Stale when its newest probe is older than this many intervals.
+// External probes can stop without an error here: GitHub delays or skips
+// scheduled runs, and turns off schedules in a repo with no activity for 60 days.
+const STALE_AFTER = 3;
+// A token holder can add at most one probe per target per 30 minutes,
+// so a leaked token cannot flood the history.
+const INGEST_QUIET_MS = 30 * 60 * 1000;
+const INGEST_MAX_BYTES = 1024;
+const INGEST_FIELDS = ['target', 'ok', 'status', 'ms', 'err'];
 
 const WINDOW_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -66,18 +75,28 @@ async function probe(t) {
   }
 }
 
-async function record(env, t, r) {
+// Returns false when the row was refused because the target already has a
+// probe newer than r.ts - quietMs. With quietMs 0 that needs a probe from the
+// future, so the cron path never hits it.
+async function record(env, t, r, quietMs = 0) {
   const ok = r.ok ? 1 : 0;
   const fast = r.ok && r.ms <= t.threshold ? 1 : 0;
-  // A batch runs as one transaction, so the raw row and the rollup never disagree.
-  await env.DB.batch([
-    env.DB.prepare('INSERT INTO probes (target, ts, ok, status, ms, err) VALUES (?1, ?2, ?3, ?4, ?5, ?6)')
-      .bind(t.id, r.ts, ok, r.status, r.ms, r.err),
-    env.DB.prepare(`INSERT INTO daily (target, day, total, good, fast) VALUES (?1, ?2, 1, ?3, ?4)
+  // A batch runs as one transaction, so the raw row and the rollup never disagree,
+  // and two racing requests cannot both pass the quiet-time check and both insert.
+  // Both statements carry the same check, and the rollup runs first, so both see
+  // the table as it was before this probe: they go in together or not at all.
+  const quiet = 'WHERE NOT EXISTS (SELECT 1 FROM probes WHERE target = ?1 AND ts > ?2 - ?3)';
+  const [, raw] = await env.DB.batch([
+    env.DB.prepare(`INSERT INTO daily (target, day, total, good, fast)
+      SELECT ?1, ?4, 1, ?5, ?6 ${quiet}
       ON CONFLICT(target, day) DO UPDATE SET
         total = total + 1, good = good + excluded.good, fast = fast + excluded.fast`)
-      .bind(t.id, dayOf(r.ts), ok, fast),
+      .bind(t.id, r.ts, quietMs, dayOf(r.ts), ok, fast),
+    env.DB.prepare(`INSERT INTO probes (target, ts, ok, status, ms, err)
+      SELECT ?1, ?2, ?4, ?5, ?6, ?7 ${quiet}`)
+      .bind(t.id, r.ts, quietMs, ok, r.status, r.ms, r.err),
   ]);
+  return raw.meta.changes === 1;
 }
 
 async function alertIfChanged(env, t, r) {
@@ -155,25 +174,31 @@ const level = (a, slo) => (a >= slo ? 'good' : a >= 1 - 10 * (1 - slo) ? 'warn' 
 const LEVEL = { good: 'met the SLO', warn: 'missed', bad: 'missed badly', none: 'no data' };
 
 // The badge is the newest probe only. Slow: it answered, but over the latency threshold.
-const STATE = { up: ['good', 'Up'], slow: ['warn', 'Slow'], down: ['bad', 'Down'], none: ['none', 'Waiting'] };
-function stateOf({ t, last }) {
+// Stale: no probe for STALE_AFTER intervals, so the newest one no longer says
+// anything about now. Grey, like no data, and never Up or Down.
+const STATE = { up: ['good', 'Up'], slow: ['warn', 'Slow'], down: ['bad', 'Down'],
+  stale: ['none', 'Stale'], none: ['none', 'Waiting'] };
+function stateOf({ t, last }, now) {
   if (!last) return 'none';
+  if (now - last.ts > STALE_AFTER * (DAY_MS / PER_DAY[t.cron])) return 'stale';
   if (!last.ok) return 'down';
   return last.ms > t.threshold ? 'slow' : 'up';
 }
 
 // One headline for the whole page, worst news first.
-function overall(stats) {
-  const named = (s) => stats.filter((x) => stateOf(x) === s).map((x) => x.t.name);
-  const [down, slow, none] = [named('down'), named('slow'), named('none')];
+function overall(stats, now) {
+  const named = (s) => stats.filter((x) => stateOf(x, now) === s).map((x) => x.t.name);
+  const [down, slow, stale, none] = [named('down'), named('slow'), named('stale'), named('none')];
   const count = (list, word) => `${list.length} service${list.length === 1 ? '' : 's'} ${word}`;
   const notes = [];
   if (down.length) notes.push(`Down: ${down.join(', ')}.`);
   if (slow.length) notes.push(`Slow: ${slow.join(', ')}.`);
+  if (stale.length) notes.push(`Stale, no recent probe: ${stale.join(', ')}.`);
   if (none.length && none.length < stats.length) notes.push(`Waiting for a first probe: ${none.join(', ')}.`);
   if (none.length === stats.length) return { tone: 'none', head: 'Waiting for first probes', notes };
   if (down.length) return { tone: 'bad', head: count(down, 'down'), notes };
   if (slow.length) return { tone: 'warn', head: count(slow, 'slow'), notes };
+  if (stale.length) return { tone: 'none', head: count(stale, 'stale'), notes };
   return { tone: 'good', head: none.length ? 'All probed services operational' : 'All services operational', notes };
 }
 
@@ -224,7 +249,8 @@ function strip(t, days, now) {
 
 function card(s, now) {
   const { t, last, days, p95 } = s;
-  const [tone, label] = STATE[stateOf(s)];
+  const state = stateOf(s, now);
+  const [tone, label] = STATE[state];
   const head = `
   <div class="head">
     <div><h2>${esc(t.name)}</h2><a class="host" href="${esc(t.url)}" rel="noopener noreferrer">${esc(new URL(t.url).host)}</a></div>
@@ -232,13 +258,15 @@ function card(s, now) {
   </div>`;
 
   if (!last) {
-    // Crons fire on the clock (every 5 min, on the hour), so the next run is the next multiple.
+    // Cloudflare crons fire on the clock, so the next run is the next multiple.
+    // GitHub starts scheduled runs late by a varying amount, so no number for it.
     const every = DAY_MS / PER_DAY[t.cron];
     const wait = Math.max(1, Math.round((Math.ceil(now / every) * every - now) / 60_000));
+    const next = t.source ? 'after the next GitHub Actions run' : `in about ${wait} min`;
     return `
 <section class="card">${head}
   <div class="empty">
-    <p><b>No probes yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive in about ${esc(wait)} min.</p>
+    <p><b>No probes yet.</b> ${esc(t.name)} is checked ${esc(EVERY[t.cron] ?? t.cron)}, so the first result should arrive ${esc(next)}.</p>
     <p>It will be held to ${esc(target(t.slo))} availability, with ${esc(target(t.latencySlo))} of good probes answering within ${esc(dur(t.threshold))}.</p>
   </div>
 </section>`;
@@ -255,9 +283,13 @@ function card(s, now) {
   const result = last.status === null ? esc(last.err) : `HTTP ${esc(last.status)} in ${esc(dur(last.ms))}`;
   const when = `<time datetime="${esc(new Date(last.ts).toISOString())}" title="${esc(stamp(last.ts))}">${esc(ago(now - last.ts))}</time>`;
 
+  const stale = state === 'stale'
+    ? `\n  <p class="last">Stale: no probe since then, though it should run ${esc(EVERY[t.cron] ?? t.cron)}. Its current state is unknown.</p>`
+    : '';
+
   return `
-<section class="card${last.ok ? '' : ' is-down'}">${head}
-  <p class="last${last.ok ? '' : ' bad'}">Last probe ${when}${last.ok ? '' : ' failed'}: ${result}</p>
+<section class="card${state === 'down' ? ' is-down' : ''}">${head}
+  <p class="last${last.ok ? '' : ' bad'}">Last probe ${when}${last.ok ? '' : ' failed'}: ${result}</p>${stale}
   <div class="hero">
     <p><span class="num">${avail === null ? 'No data' : esc(pct(avail))}</span> <span class="cap">availability, 30 days</span></p>
     ${verdict(avail, t.slo, 'SLO')}
@@ -281,9 +313,10 @@ const favicon = (tone) => "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/20
   + `%3Ccircle cx='8' cy='8' r='7' fill='%23${DOT[tone]}'/%3E%3C/svg%3E`;
 
 function renderPage(stats, now) {
-  const { tone, head, notes } = overall(stats);
-  const probed = TARGETS.map((t) =>
-    `<li>${esc(new URL(t.url).host)}: ${esc(EVERY[t.cron] ?? t.cron)}, ${esc(dur(t.timeout))} timeout</li>`).join('');
+  const { tone, head, notes } = overall(stats, now);
+  // source is only ever 'github' for now.
+  const probed = TARGETS.map((t) => `<li>${esc(new URL(t.url).host)}: ${esc(EVERY[t.cron] ?? t.cron)}`
+    + ` from ${t.source ? 'GitHub Actions, not from Cloudflare' : 'Cloudflare'}, ${esc(dur(t.timeout))} timeout</li>`).join('');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -414,12 +447,16 @@ function renderPage(stats, now) {
 </main>
 <footer>
   <p>What is probed, and how often. A probe is up when the site answers 2xx within the timeout.
-    The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.</p>
+    The badge on each service is its newest probe. Slow means it answered, but slower than the latency threshold.
+    Stale means no probe has arrived for ${esc(STALE_AFTER)} of its intervals, so its current state is unknown.</p>
   <ul>${probed}</ul>
   ${PAUSED.map((t) => `<p>Paused: ${esc(t.name)} (${esc(new URL(t.url).host)}). ${esc(t.why)}</p>`).join('')}
-  <p>Probes run on a Cloudflare Cron Trigger, from whichever Cloudflare data center picks up the job.
-    That means this monitor shares fate with the two Cloudflare-hosted sites: if Cloudflare has an outage,
+  <p>The two Cloudflare-hosted sites are probed by a Cloudflare Cron Trigger, from whichever Cloudflare data center
+    picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
     those sites and this page can go down together, and no alert goes out.</p>
+  <p>Hulog is probed by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
+    onrender.com blocks requests from Cloudflare Workers, so a probe from Cloudflare would measure that block, not Hulog.
+    GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
 </footer>
 </div>
 </body>
@@ -430,14 +467,80 @@ function text(body, status, extra = {}) {
   return new Response(body, { status, headers: { ...HEADERS, 'content-type': 'text/plain; charset=utf-8', ...extra } });
 }
 
+// ---------- results from probes outside Cloudflare ----------
+
+// Hashing both sides first gives two equal-length values, so the loop below
+// takes the same time wherever they differ and leaks nothing about the length.
+// Node has no crypto.subtle.timingSafeEqual, so this works in tests and workerd alike.
+async function sameSecret(a, b) {
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([a, b].map(async (s) =>
+    new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s)))));
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+async function ingest(request, env) {
+  const no = (why, status = 400, extra) => text(`${why}\n`, status, extra);
+  // No secret means nobody can be checked, so nothing is accepted.
+  if (!env.INGEST_TOKEN) return no('Ingest is not configured', 503);
+  const auth = request.headers.get('authorization') ?? '';
+  if (!auth.startsWith('Bearer ') || !(await sameSecret(auth.slice(7), env.INGEST_TOKEN))) {
+    return no('Unauthorized', 401, { 'www-authenticate': 'Bearer' });
+  }
+
+  // Content-Length can be missing or wrong, so the real length is checked too.
+  // ponytail: the body is read whole before that check; only token holders get here.
+  const tooBig = `Body over ${INGEST_MAX_BYTES} bytes`;
+  if (Number(request.headers.get('content-length')) > INGEST_MAX_BYTES) return no(tooBig, 413);
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > INGEST_MAX_BYTES) return no(tooBig, 413);
+  let b;
+  try {
+    b = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return no('Body is not JSON');
+  }
+
+  if (typeof b !== 'object' || b === null || Array.isArray(b)) return no('Body must be a JSON object');
+  if (Object.keys(b).some((k) => !INGEST_FIELDS.includes(k))) {
+    return no(`Only these fields are allowed: ${INGEST_FIELDS.join(', ')}`);
+  }
+  if (typeof b.target !== 'string') return no('target must be a string');
+  const t = EXTERNAL.get(b.target);
+  if (!t) return no('Unknown target', 404);
+  if (typeof b.ok !== 'boolean') return no('ok must be true or false');
+  if (b.status !== null && !(Number.isInteger(b.status) && b.status >= 100 && b.status <= 599)) {
+    return no('status must be an integer from 100 to 599, or null');
+  }
+  if (!(Number.isInteger(b.ms) && b.ms >= 0 && b.ms <= t.timeout)) return no(`ms must be an integer from 0 to ${t.timeout}`);
+  if (b.err !== null && !(typeof b.err === 'string' && b.err.length <= 200)) {
+    return no('err must be a string of at most 200 characters, or null');
+  }
+  // Same meaning as a probe from here: up is a 2xx, and no response needs a reason.
+  if (b.ok && !(b.status >= 200 && b.status <= 299)) return no('ok true needs a 2xx status');
+  if (b.status === null && b.err === null) return no('status null needs an err');
+
+  // The Worker's clock, not the sender's, so a token cannot backdate or reorder history.
+  const r = { ts: Date.now(), ok: b.ok, status: b.status, ms: b.ms, err: b.err };
+  if (!(await record(env, t, r, INGEST_QUIET_MS))) {
+    return no(`${t.id} already has a probe from the last ${INGEST_QUIET_MS / 60_000} minutes`, 429);
+  }
+  console.log(`${t.id} (${t.source}): ${r.ok ? 'up' : 'down'}, ${r.status ?? r.err}, ${r.ms} ms`);
+  await alertIfChanged(env, t, r);
+  return new Response(null, { status: 204, headers: HEADERS });
+}
+
 export default {
   async scheduled(controller, env) {
-    const due = TARGETS.filter((t) => t.cron === controller.cron);
+    // Never probe an external target from here: that is the request the bot check blocks.
+    const due = TARGETS.filter((t) => !t.source && t.cron === controller.cron);
     if (due.length === 0) console.warn(`no targets for cron "${controller.cron}"`);
     // allSettled, so one target failing never stops another being recorded.
     const results = await Promise.allSettled(due.map(async (t) => {
       const r = await probe(t);
-      await record(env, t, r);
+      if (!(await record(env, t, r))) throw new Error(`${t.id}: not recorded, a newer probe exists`);
       console.log(`${t.id}: ${r.ok ? 'up' : 'down'}, ${r.status ?? r.err}, ${r.ms} ms`);
       await alertIfChanged(env, t, r);
     }));
@@ -446,7 +549,12 @@ export default {
   },
 
   async fetch(request, env) {
-    if (new URL(request.url).pathname !== '/') return text('Not found\n', 404);
+    const { pathname } = new URL(request.url);
+    if (pathname === '/ingest') {
+      if (request.method !== 'POST') return text('Method not allowed\n', 405, { allow: 'POST' });
+      return ingest(request, env);
+    }
+    if (pathname !== '/') return text('Not found\n', 404);
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return text('Method not allowed\n', 405, { allow: 'GET, HEAD' });
     }

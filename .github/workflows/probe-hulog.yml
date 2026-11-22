@@ -1,0 +1,86 @@
+# Probes Hulog from outside Cloudflare and sends the result to the status page.
+# The Worker cannot probe it: the bot check in front of onrender.com answers
+# requests from Cloudflare Workers with HTTP 429 and cf-mitigated: challenge.
+name: Probe Hulog
+
+on:
+  schedule:
+    # Minute 7, not 0: GitHub starts on-the-hour jobs late, because that is
+    # when most scheduled workflows fire. Keep in step with TARGETS in src/index.js.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+# The job needs no GitHub API access at all, and there is no checkout.
+permissions: {}
+
+concurrency:
+  group: probe-hulog
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe Hulog
+        run: |
+          # Same probe as the Worker's: a GET that follows redirects, 90 s timeout.
+          # time_starttransfer is the time to the first byte of the response, the
+          # closest match to the Worker timing up to the response headers.
+          code=0
+          out=$(curl --silent --show-error --location --max-time 90 \
+            --user-agent 'theo-uptime/1.0 (+https://status.theoith.ink)' \
+            --dump-header headers.txt --output /dev/null \
+            --write-out '%{http_code} %{time_starttransfer} %{time_total}' \
+            https://hulog.onrender.com/ 2> curl.err) || code=$?
+          read -r status ttfb total <<< "$out"
+          echo "curl exit $code, HTTP $status, first byte $ttfb s, total $total s"
+
+          # A challenge is the bot check answering, not Hulog. Posting it would
+          # record a false DOWN, so record nothing and fail the run instead.
+          if grep -qis '^cf-mitigated:[[:space:]]*challenge' headers.txt; then
+            echo "::error::onrender.com answered with a bot check (cf-mitigated: challenge, HTTP $status). Nothing was sent: this measured the bot check, not Hulog."
+            exit 1
+          fi
+
+          # Seconds to whole ms, capped at the 90 s timeout the status page accepts.
+          to_ms() { awk -v s="$1" 'BEGIN { m = int(s * 1000 + 0.5); print (m > 90000 ? 90000 : m) }'; }
+          if [ "$status" != 000 ]; then
+            # A response came back, so this is a result even if the body then failed.
+            jq -nc --argjson status "$status" --argjson ms "$(to_ms "$ttfb")" \
+              '{target: "hulog", ok: ($status >= 200 and $status <= 299), status: $status, ms: $ms, err: null}' > result.json
+          else
+            # No response at all is a real failed probe. A timeout reads like the Worker's.
+            if [ "$code" = 28 ]; then
+              err='timeout after 90 s'
+            else
+              err=$(head -n 1 curl.err | sed 's/^curl: //' | cut -c 1-200)
+            fi
+            jq -nc --arg err "${err:-curl exit $code}" --argjson ms "$(to_ms "$total")" \
+              '{target: "hulog", ok: false, status: null, ms: $ms, err: $err}' > result.json
+          fi
+          cat result.json
+
+      - name: Send the result to the status page
+        env:
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+        run: |
+          if [ -z "$INGEST_TOKEN" ]; then
+            echo "::error::The INGEST_TOKEN secret is not set for this repo."
+            exit 1
+          fi
+          # The header goes in on stdin, so the token is never in a process list or the log.
+          code=$(printf 'Authorization: Bearer %s\n' "$INGEST_TOKEN" | curl --silent --show-error --max-time 30 \
+            --header @- --header 'Content-Type: application/json' --data-binary @result.json \
+            --output response.txt --write-out '%{http_code}' \
+            https://status.theoith.ink/ingest) || true
+          if [ "$code" != 204 ]; then
+            echo "::error::The status page answered HTTP $code, not 204."
+            cat response.txt 2> /dev/null || true
+            exit 1
+          fi
+          echo "Recorded."
