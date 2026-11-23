@@ -40,7 +40,7 @@ test('status page escapes database text and ships no script', async () => {
   assert.match(html, /Overspent by/);
   // Hulog is back as a card, and the footer says where its probe runs.
   assert.match(html, /<h2>Hulog<\/h2>/);
-  assert.match(html, /hulog\.onrender\.com: every hour from GitHub Actions, not from Cloudflare/);
+  assert.match(html, /hulog\.onrender\.com: every hour from GitHub Actions, started by this monitor, with GitHub&rsquo;s own schedule as a backup, 90 s timeout/);
   assert.doesNotMatch(html, /Paused:/);
 });
 
@@ -95,6 +95,7 @@ test('a probe older than 3 intervals is Stale, never Up, and the banner counts i
   assert.match(hulog, /No check for 3 hours, so its current state is unknown\./);
   assert.match(hulog, /Checked <time[^>]*>3 hours ago<\/time>/);
   assert.match(hulog, /<b>HTTP 200 in 36\.6 s<\/b>/);
+  assert.match(hulog, /From GitHub Actions, started by this monitor</);
   assert.match(html, /<section class="banner none"[^]*1 service stale/);
   assert.match(html, /Stale, no recent check: Hulog\./);
   assert.doesNotMatch(html, /All services operational/);

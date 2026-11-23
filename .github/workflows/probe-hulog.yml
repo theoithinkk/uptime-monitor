@@ -5,8 +5,10 @@ name: Probe Hulog
 
 on:
   schedule:
+    # A backup. GitHub skipped most of these runs, so the Worker now starts this
+    # workflow at minute 5 of every hour through workflow_dispatch below.
     # Minute 7, not 0: GitHub starts on-the-hour jobs late, because that is
-    # when most scheduled workflows fire. Keep in step with TARGETS in src/index.js.
+    # when most scheduled workflows fire.
     - cron: '7 * * * *'
   workflow_dispatch:
 
@@ -78,6 +80,12 @@ jobs:
             --header @- --header 'Content-Type: application/json' --data-binary @result.json \
             --output response.txt --write-out '%{http_code}' \
             https://status.theoith.ink/ingest) || true
+          if [ "$code" = 429 ]; then
+            # The Worker-started run and the backup schedule landed in the same half
+            # hour, and the other one's result is already recorded. Not an error.
+            echo "::notice::The status page already has a Hulog result from the last 30 minutes, so this one was not recorded."
+            exit 0
+          fi
           if [ "$code" != 204 ]; then
             echo "::error::The status page answered HTTP $code, not 204."
             cat response.txt 2> /dev/null || true

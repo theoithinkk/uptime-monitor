@@ -15,23 +15,26 @@ const TARGETS = [
   // sleep, so this measures the cold start a real visitor gets.
   // source: the probe runs outside Cloudflare and POSTs its result to /ingest,
   // because the bot check in front of onrender.com blocks requests from Workers.
-  // The cron is the schedule in .github/workflows/probe-hulog.yml.
+  // The cron is when this Worker starts that probe on GitHub (see startHulogProbe).
   { id: 'hulog', name: 'Hulog', url: 'https://hulog.onrender.com/', source: 'github',
-    cron: '7 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95 },
+    cron: '5 * * * *', timeout: 90_000, threshold: 60_000, slo: 0.99, latencySlo: 0.95 },
 ];
 // The only targets /ingest accepts. Anything else is a 404.
 const EXTERNAL = new Map(TARGETS.filter((t) => t.source).map((t) => [t.id, t]));
+// Starts .github/workflows/probe-hulog.yml. Hardcoded like TARGETS, so no request
+// can point the Worker, or its GitHub token, anywhere else.
+const HULOG_DISPATCH = 'https://api.github.com/repos/theoithinkk/uptime-monitor/actions/workflows/probe-hulog.yml/dispatches';
 // Not probed and not shown as a panel; the page footer names each one and its
 // `why`. Empty for now. A paused target keeps its settings so it can move back.
 const PAUSED = [];
-// Must match the crons in wrangler.toml, or the workflow for an external target.
-const EVERY = { '*/5 * * * *': 'every 5 minutes', '7 * * * *': 'every hour' };
+// Must match the crons in wrangler.toml.
+const EVERY = { '*/5 * * * *': 'every 5 minutes', '5 * * * *': 'every hour' };
 // Probes per day for each cron. The error budget is counted against a full
 // window of probes, so a failure on day one costs what it would on day 30.
-const PER_DAY = { '*/5 * * * *': 288, '7 * * * *': 24 };
+const PER_DAY = { '*/5 * * * *': 288, '5 * * * *': 24 };
 // A target is Stale when its newest probe is older than this many intervals.
-// External probes can stop without an error here: GitHub delays or skips
-// scheduled runs, and turns off schedules in a repo with no activity for 60 days.
+// External probes can stop without an error here: a GitHub run can fail to start,
+// and GitHub turns off workflows in a repo with no activity for 60 days.
 const STALE_AFTER = 3;
 // A token holder can add at most one probe per target per 30 minutes,
 // so a leaked token cannot flood the history.
@@ -137,6 +140,36 @@ async function sendTelegram(env, text) {
   const body = await res.text(); // Telegram's error text never contains the token
   if (!res.ok) throw new Error(`Telegram answered ${res.status}: ${body.slice(0, 200)}`);
   console.log(`alert sent: ${text}`);
+}
+
+// GitHub's own schedule skipped most hourly runs, and Cloudflare's cron does not,
+// so the Worker starts the run. The probe itself still runs on GitHub. A start that
+// fails is only logged: the missed hour shows as Stale, and nothing else waits on it.
+async function startHulogProbe(env) {
+  if (!env.GH_DISPATCH_TOKEN) {
+    console.warn('GH_DISPATCH_TOKEN not set, Hulog probe not started');
+    return;
+  }
+  try {
+    const res = await fetch(HULOG_DISPATCH, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${env.GH_DISPATCH_TOKEN}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        'user-agent': USER_AGENT, // GitHub refuses requests without one
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ ref: 'main' }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await res.text(); // GitHub's error text never contains the token
+    if (res.status === 204) console.log('Hulog probe started on GitHub Actions');
+    // GitHub pretty-prints its JSON; one line reads better in wrangler tail.
+    else console.error(`GitHub answered ${res.status} to the Hulog dispatch: ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+  } catch (e) {
+    console.error(`Hulog dispatch failed: ${String(e.message || e).slice(0, 200)}`);
+  }
 }
 
 // ---------- status page ----------
@@ -591,7 +624,7 @@ function service(v, now, open) {
 
   if (!last) {
     // Cloudflare crons fire on the clock, so the next run is the next multiple.
-    // GitHub starts scheduled runs late by a varying amount, so no number for it.
+    // A GitHub run reports back a varying time after it is started, so no number for it.
     const every = DAY_MS / PER_DAY[t.cron];
     const wait = Math.max(1, Math.round((Math.ceil(now / every) * every - now) / 60_000));
     const next = t.source ? 'after the next GitHub Actions run' : `in about ${wait} min`;
@@ -639,7 +672,7 @@ function service(v, now, open) {
   </div>
   <div class="more">
     <dl class="minor">${row('Last check', '', result, `<p class="s">${esc(stamp(last.ts))}</p>`)}${row('Checked', '', esc(EVERY[t.cron] ?? t.cron),
-      `<p class="s">From ${t.source ? 'GitHub Actions' : 'Cloudflare'}</p>`)}${row('Days with data', '',
+      `<p class="s">From ${t.source ? 'GitHub Actions, started by this monitor' : 'Cloudflare'}</p>`)}${row('Days with data', '',
       esc(`${v.cal.filter(({ d }) => d).length} of ${WINDOW_DAYS}`),
       h.worst ? `<p class="s">${esc(`Worst: ${h.worst.day}, ${pct(h.worst.a)} up`)}</p>` : '')}
     </dl>${v.left === null ? '' : table(v)}
@@ -664,7 +697,8 @@ function renderPage(stats, now, open = null) {
   const { tone, head, notes } = overall(views, now);
   // source is only ever 'github' for now.
   const probed = TARGETS.map((t) => `<li>${esc(new URL(t.url).host)}: ${esc(EVERY[t.cron] ?? t.cron)}`
-    + ` from ${t.source ? 'GitHub Actions, not from Cloudflare' : 'Cloudflare'}, ${esc(dur(t.timeout))} timeout</li>`).join('');
+    + ` from ${t.source ? 'GitHub Actions, started by this monitor, with GitHub&rsquo;s own schedule as a backup'
+      : 'Cloudflare'}, ${esc(dur(t.timeout))} timeout</li>`).join('');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -993,9 +1027,10 @@ function renderPage(stats, now, open = null) {
     <p>The two Cloudflare-hosted sites are checked by a Cloudflare Cron Trigger, from whichever Cloudflare data center
       picks up the job. That means this monitor shares fate with them: if Cloudflare has an outage,
       those sites and this page can go down together, and no alert goes out.</p>
-    <p>Hulog is checked by a scheduled GitHub Actions job, which sends each result here. The bot check in front of
+    <p>Hulog is checked every hour by a GitHub Actions job, which sends each result here. The bot check in front of
       onrender.com blocks requests from Cloudflare Workers, so a check from Cloudflare would measure that block, not Hulog.
-      GitHub can start a scheduled run late or skip it, and a skipped run is missing data, not a failure.</p>
+      This monitor starts the job, because GitHub&rsquo;s own schedule often ran late or not at all; that schedule stays
+      as a backup. A skipped hour is missing data, not a failure.</p>
   </div>
   <p><a class="back" href="https://theoith.ink/">&larr; theoith.ink</a></p>
 </footer>
@@ -1075,6 +1110,9 @@ async function ingest(request, env) {
 
 export default {
   async scheduled(controller, env) {
+    // Hulog's hour only starts its GitHub run. The sites have their own */5 invocation,
+    // which Cloudflare fires separately, even at minute 5.
+    if (controller.cron === EXTERNAL.get('hulog').cron) return startHulogProbe(env);
     // Never probe an external target from here: that is the request the bot check blocks.
     const due = TARGETS.filter((t) => !t.source && t.cron === controller.cron);
     if (due.length === 0) console.warn(`no targets for cron "${controller.cron}"`);

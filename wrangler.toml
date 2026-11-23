@@ -10,9 +10,11 @@ workers_dev = false
 preview_urls = false
 
 [triggers]
-# Every 5 minutes for the two Cloudflare sites. Hulog has no cron here: it is
-# probed from .github/workflows/probe-hulog.yml, which posts to /ingest.
-crons = ["*/5 * * * *"]
+# Every 5 minutes for the two Cloudflare sites. At minute 5 of each hour the
+# Worker starts .github/workflows/probe-hulog.yml on GitHub, which probes Hulog
+# and posts to /ingest. Minute 5 keeps it clear of the workflow's own backup
+# schedule at minute 7. Keep in step with TARGETS in src/index.js.
+crons = ["*/5 * * * *", "5 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import worker from '../src/index.js';
 
 const TOKEN = 'test-only-token-not-a-real-secret';
@@ -158,7 +159,81 @@ test('the scheduled handler never fetches Hulog, whatever cron fires', async (t)
   t.mock.method(console, 'log', () => {});
   t.mock.method(console, 'warn', () => {});
   const DB = fakeDB();
-  for (const cron of ['*/5 * * * *', '7 * * * *', '0 * * * *']) await worker.scheduled({ cron }, { DB });
+  for (const cron of ['*/5 * * * *', '5 * * * *', '7 * * * *', '0 * * * *']) await worker.scheduled({ cron }, { DB });
   assert.deepEqual(urls.sort(), ['https://theoith.ink/', 'https://writeups.theoith.ink/']);
   assert.equal(DB.probes.some((p) => p.target === 'hulog'), false);
+});
+
+// ---------- the hourly start of the GitHub probe ----------
+
+const GH = 'test-only-github-token-not-real';
+const DISPATCH = 'https://api.github.com/repos/theoithinkk/uptime-monitor/actions/workflows/probe-hulog.yml/dispatches';
+
+// Records every fetch and answers with s.status (0 rejects, like a network error),
+// and keeps every log line so a test can check none of them holds the token.
+function stub(t) {
+  const s = { status: 204, calls: [], logs: [] };
+  t.mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    s.calls.push({ url: String(url), init });
+    if (s.status === 0) throw new TypeError('Network connection lost.');
+    return new Response(s.status === 204 ? null : `{"message":"answer ${s.status}"}`, { status: s.status });
+  });
+  for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (...a) => s.logs.push(a.join(' ')));
+  return s;
+}
+
+test('minute 5 starts the Hulog workflow with one POST to the fixed URL, and probes nothing', async (t) => {
+  const s = stub(t);
+  const DB = fakeDB();
+  await worker.scheduled({ cron: '5 * * * *' }, { DB, GH_DISPATCH_TOKEN: GH });
+  assert.equal(s.calls.length, 1);
+  const [{ url, init }] = s.calls;
+  assert.equal(url, DISPATCH);
+  assert.equal(init.method, 'POST');
+  const h = new Headers(init.headers);
+  assert.equal(h.get('authorization'), `Bearer ${GH}`);
+  assert.equal(h.get('accept'), 'application/vnd.github+json');
+  assert.equal(h.get('x-github-api-version'), '2022-11-28');
+  assert.match(h.get('user-agent'), /^theo-uptime\//);
+  assert.deepEqual(JSON.parse(init.body), { ref: 'main' });
+  assert.ok(init.signal instanceof AbortSignal);
+  assert.equal(DB.batches.length, 0);
+  assert.deepEqual(s.logs, ['Hulog probe started on GitHub Actions']);
+});
+
+test('minute 5 without GH_DISPATCH_TOKEN warns, sends nothing and does not throw', async (t) => {
+  const s = stub(t);
+  await worker.scheduled({ cron: '5 * * * *' }, { DB: fakeDB() });
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(s.logs, ['GH_DISPATCH_TOKEN not set, Hulog probe not started']);
+});
+
+test('a refused or failed dispatch is logged without the token and never thrown', async (t) => {
+  const s = stub(t);
+  for (const status of [401, 404, 500, 0]) {
+    s.status = status;
+    await worker.scheduled({ cron: '5 * * * *' }, { DB: fakeDB(), GH_DISPATCH_TOKEN: GH });
+    assert.match(s.logs.at(-1), status ? new RegExp(`GitHub answered ${status} .*answer ${status}`) : /Network connection lost/);
+  }
+  assert.equal(s.calls.length, 4);
+  assert.ok(s.logs.every((line) => !line.includes(GH)));
+});
+
+test('the 5-minute cron still probes only the two sites, and never calls GitHub', async (t) => {
+  const s = stub(t);
+  s.status = 200;
+  const DB = fakeDB();
+  await worker.scheduled({ cron: '*/5 * * * *' }, { DB, GH_DISPATCH_TOKEN: GH });
+  assert.deepEqual(s.calls.map((c) => c.url).sort(), ['https://theoith.ink/', 'https://writeups.theoith.ink/']);
+  assert.deepEqual(DB.probes.map((p) => p.target).sort(), ['portfolio', 'writeups']);
+});
+
+test('the workflow counts a 429 from /ingest as already recorded, and fails on any other non-204', async () => {
+  // A Windows checkout with core.autocrlf has CRLF line endings.
+  const yml = (await readFile(new URL('../.github/workflows/probe-hulog.yml', import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
+  const send = yml.slice(yml.indexOf('- name: Send the result'));
+  const ok429 = send.search(/if \[ "\$code" = 429 \]; then\n(\s*#.*\n)*\s*echo "::notice::[^"\n]+"\n\s*exit 0\n\s*fi\n/);
+  const not204 = send.search(/if \[ "\$code" != 204 \]; then\n[^]*?exit 1\n\s*fi\n/);
+  assert.ok(ok429 > 0, 'a 429 branch that exits 0 with a notice');
+  assert.ok(not204 > ok429, 'the 204 check after it still fails the run');
 });

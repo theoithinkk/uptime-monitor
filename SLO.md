@@ -4,7 +4,7 @@ These are the written SLOs for my three public services. The Worker in this repo
 
 ## How every SLO here is measured
 
-- **Probe:** a GET request that follows redirects and is timed up to the response headers. The two sites are probed from a Cloudflare Cron Trigger. Hulog is probed from a scheduled GitHub Actions job, timed to the first byte of the response, which then sends the result to the Worker.
+- **Probe:** a GET request that follows redirects and is timed up to the response headers. The two sites are probed from a Cloudflare Cron Trigger. Hulog is probed from a GitHub Actions job that the Worker starts every hour, timed to the first byte of the response, which then sends the result to the Worker.
 - **Availability SLI:** probes that answered 2xx within the timeout, divided by all probes.
 - **Latency SLI:** good probes that answered under the latency threshold, divided by good probes. A failed probe counts against availability only, never twice.
 - **Window:** rolling 30 days, counted in UTC days, today included. 30 days is 43,200 minutes.
@@ -44,7 +44,7 @@ The budget is always counted against a full 30-day window, even before 30 days o
 
 | | |
 |---|---|
-| Probe | every hour from GitHub Actions (minute 7), 90 s timeout, 720 probes per window. It probes `/`, because `/api/health` returns 404. |
+| Probe | every hour from GitHub Actions, started by the Worker at minute 5 (GitHub's own schedule at minute 7 is a backup), 90 s timeout, 720 probes per window. It probes `/`, because `/api/health` returns 404. |
 | Availability SLO | 99% |
 | Error budget | 7.2 probes, which is 7.2 hours (432 minutes). 7 failed hourly probes keep the SLO; the 8th breaks it. |
 | Latency SLO | 95% of good probes under 60 s, so 36 slow probes per window |
@@ -59,6 +59,11 @@ The budget is always counted against a full 30-day window, even before 30 days o
 - **Scheduled runs can be late or skipped.** GitHub starts scheduled jobs late when it is busy, and can drop them. A skipped run is missing data, not a failure: it adds nothing to the probe count and spends no budget. If no probe arrives for 3 hours, the status page shows Hulog as Stale instead of showing an old result as current.
 - **The bot check could reach GitHub too.** If a probe gets `cf-mitigated: challenge`, the job records nothing and fails, so the bot check can never count as Hulog being down.
 - **The 60-day rule.** GitHub turns off scheduled workflows in a public repo after 60 days with no activity in the repo. Until it is turned back on, there are no probes and Hulog shows as Stale. Those hours are missing data, not downtime.
+
+**Started by the Worker, 2026-11-23.** GitHub ran only 2 of about 15 scheduled runs in the first 15 hours (18:24 UTC on 2026-11-22 and 00:09 UTC on 2026-11-23), so Hulog showed as Stale most of the time. A run started by hand began at once. The Worker now starts the workflow at minute 5 of every hour through GitHub's API, and the workflow's own schedule at minute 7 stays as a backup. When both land in the same half hour, only the first result is recorded. The probe, the targets and the window are unchanged. Caveats:
+
+- **The start shares fate with Cloudflare.** If Cloudflare is down, the hourly start stops too. GitHub's schedule is still there as a backup, but its results go to the Worker as well, so they are only recorded while Cloudflare answers.
+- **A skipped hour is still missing data.** If a start fails (GitHub refuses it, or the token has expired), that hour adds nothing to the probe count and spends no budget. After 3 hours without a probe the page shows Hulog as Stale, never as down.
 
 ## Error budget policy
 
